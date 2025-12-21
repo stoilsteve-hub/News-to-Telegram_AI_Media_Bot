@@ -1,0 +1,38 @@
+# Secrets
+.env
+config/.env
+*.env
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.venv311/
+
+# Runtime files
+.bot.lock
+*.log
+
+# Databases
+*.sqlite
+*.sqlite3
+*.db
+posted_items.sqlite
+posted_items.sqlite.bak
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

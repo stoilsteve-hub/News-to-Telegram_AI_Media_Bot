@@ -45,7 +45,12 @@ OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
 DB_PATH = os.path.join(BASE_DIR, "posted_items.sqlite")
 
 # turn OFF previews so Telegram doesn't show Swedish page snippets
+
+# turn OFF previews so Telegram doesn't show Swedish page snippets
 DISABLE_PREVIEWS = True
+AUTO_POST = (os.getenv("AUTO_POST", "false").lower().strip() == "true")
+
+AUTO_POST = (os.getenv("AUTO_POST", "false").lower().strip() == "true")
 
 if not BOT_TOKEN or not OPENAI_API_KEY or not EDITOR_CHAT_ID or not PUBLIC_CHANNEL_ID:
     raise RuntimeError(
@@ -58,6 +63,7 @@ if not BOT_TOKEN or not OPENAI_API_KEY or not EDITOR_CHAT_ID or not PUBLIC_CHANN
 # ============================================================
 
 LOCK_PATH = os.path.join(BASE_DIR, ".bot.lock")
+
 
 def acquire_lock_or_exit() -> None:
     if os.path.exists(LOCK_PATH):
@@ -82,6 +88,7 @@ def acquire_lock_or_exit() -> None:
     with open(LOCK_PATH, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
 
+
 def release_lock() -> None:
     try:
         if os.path.exists(LOCK_PATH):
@@ -89,22 +96,25 @@ def release_lock() -> None:
     except Exception:
         pass
 
+
 # ============================================================
 # RSS
 # ============================================================
 
 feedparser.USER_AGENT = "SwedishWallBot/10.0 (+https://t.me/SWEzhach0k)"
 
+
 def google_news_rss(q: str) -> str:
     return f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=sv&gl=SE&ceid=SE:sv"
+
 
 RSS_FEEDS = [
     ("SVT Nyheter", "https://www.svt.se/nyheter/rss.xml"),
     ("SR Ekot", "https://api.sr.se/api/rss/pod/3795"),
     ("8 Sidor", "https://8sidor.se/feed/"),
     ("Expressen Nyheter", "https://feeds.expressen.se/nyheter/"),
-("Government.se via Google", google_news_rss("site:government.se")),
-("TV4.se via Google", google_news_rss("site:tv4.se")),
+    ("Government.se via Google", google_news_rss("site:government.se")),
+    ("TV4.se via Google", google_news_rss("site:tv4.se")),
     ("Expressen Debatt", "https://feeds.expressen.se/debatt/"),
     ("Aftonbladet", "https://rss.aftonbladet.se/rss2/small/pages/sections/senastenytt/"),
 ]
@@ -123,8 +133,10 @@ HOT_TERMS = [
     "lån", "ränta", "riksbank", "euro", "dollar", "eu"
 ]
 
+
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").lower())
+
 
 def score_entry(title: str, summary: str) -> int:
     text = normalize((title or "") + " " + (summary or ""))
@@ -137,21 +149,25 @@ def score_entry(title: str, summary: str) -> int:
             score += 2
     return score
 
+
 def detect_article_type(source_name: str, title: str, link: str) -> str:
     t = (source_name + " " + (title or "") + " " + (link or "")).lower()
     if any(x in t for x in ["debatt", "ledare", "opinion"]):
         return "debate"
     return "news"
 
+
 def fetch_feed(url: str) -> feedparser.FeedParserDict:
     resp = requests.get(url, timeout=20, headers={"User-Agent": feedparser.USER_AGENT})
     resp.raise_for_status()
     return feedparser.parse(resp.content)
 
+
 def extract_item_id(entry) -> str:
     link = (entry.get("link") or "").strip()
     eid = (entry.get("id") or entry.get("guid") or link or "").strip()
     return eid
+
 
 def strip_html_text(s: str) -> str:
     s = s or ""
@@ -162,6 +178,7 @@ def strip_html_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 # ============================================================
 # PARSE PHOTO FROM ORIGINAL ARTICLE
@@ -176,6 +193,7 @@ META_OG_IMAGE_ALT_RE = re.compile(
     re.I
 )
 IMG_SRC_RE = re.compile(r"<img[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+
 
 def fetch_article_image(article_url: str) -> str:
     """
@@ -215,6 +233,7 @@ def fetch_article_image(article_url: str) -> str:
 
     return ""
 
+
 # ============================================================
 # IMAGE FILTERING (Mode A: if not usable -> no image)
 # ============================================================
@@ -232,6 +251,7 @@ BLOCKED_IMAGE_HOSTS = {
     "news.google.com",
     "www.google.com",
 }
+
 
 def _looks_like_logo_url(image_url: str) -> bool:
     u = (image_url or "").strip()
@@ -254,6 +274,7 @@ def _looks_like_logo_url(image_url: str) -> bool:
 
     hay = f"{host} {path} {query}"
     return any(k in hay for k in BLOCKED_IMAGE_KEYWORDS)
+
 
 def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
     """
@@ -303,20 +324,21 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
                 continue
             if i + 2 > n:
                 break
-            seglen = int.from_bytes(data[i:i+2], "big", signed=False)
+            seglen = int.from_bytes(data[i:i + 2], "big", signed=False)
             if seglen < 2 or i + seglen > n:
                 break
             # SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15
             if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
                 if i + 7 <= n:
-                    h = int.from_bytes(data[i+3:i+5], "big", signed=False)
-                    w = int.from_bytes(data[i+5:i+7], "big", signed=False)
+                    h = int.from_bytes(data[i + 3:i + 5], "big", signed=False)
+                    w = int.from_bytes(data[i + 5:i + 7], "big", signed=False)
                     return (w, h)
                 break
             i += seglen
         return (0, 0)
 
     return (0, 0)
+
 
 def is_usable_image(image_url: str) -> bool:
     """
@@ -377,6 +399,7 @@ def is_usable_image(image_url: str) -> bool:
         # If probing fails, err on "no image" (safer: avoids broken posts).
         return False
 
+
 # ============================================================
 # DOWNLOAD IMAGE BYTES (so Telegram doesn't need to fetch the URL)
 # ============================================================
@@ -418,7 +441,8 @@ def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[b
 
     # Validate type lightly
     if "image" not in ct:
-        if not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG") or data[:4] == b"RIFF" or data[:4] == b"GIF8"):
+        if not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG") or data[:4] == b"RIFF" or data[
+            :4] == b"GIF8"):
             raise ValueError(f"not an image (content-type={ct or 'unknown'})")
 
     # Filename guess
@@ -433,6 +457,7 @@ def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[b
         ext = ".jpg"
 
     return data, f"photo{ext}"
+
 
 # ============================================================
 # HASHTAGS (core + topic-based, Russian-only, capped)
@@ -512,6 +537,7 @@ TOPIC_TRIGGERS = {
     "sports": ["спорт", "футбол", "хокке", "sport", "fotboll", "hockey"],
 }
 
+
 def pick_hashtags(rss_title: str, rss_summary: str, source: str) -> list[str]:
     """
     Picks a compact set of relevant hashtags based on RSS text.
@@ -540,12 +566,14 @@ def pick_hashtags(rss_title: str, rss_summary: str, source: str) -> list[str]:
 
     return uniq[:12]
 
+
 # ============================================================
 # DB
 # ============================================================
 
 def utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl_type: str) -> None:
     cur = conn.cursor()
@@ -554,6 +582,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl_type: str
     if col not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}")
         conn.commit()
+
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -590,14 +619,17 @@ def init_db() -> sqlite3.Connection:
 
     return conn
 
+
 def already_posted(conn: sqlite3.Connection, item_id: str) -> bool:
     c = conn.cursor()
     c.execute("SELECT 1 FROM posted WHERE item_id=?", (item_id,))
     return c.fetchone() is not None
 
+
 def mark_posted(conn: sqlite3.Connection, item_id: str) -> None:
     conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at) VALUES (?, ?)", (item_id, utc_now_iso()))
     conn.commit()
+
 
 def save_failure(conn: sqlite3.Connection, source: str, item_id: str, stage: str, error: str) -> None:
     conn.execute(
@@ -606,7 +638,9 @@ def save_failure(conn: sqlite3.Connection, source: str, item_id: str, stage: str
     )
     conn.commit()
 
-def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending", error: str | None = None, image_url: str = "") -> int:
+
+def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending", error: str | None = None,
+               image_url: str = "") -> int:
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO drafts (created_at, text, status, error, image_url) VALUES (?, ?, ?, ?, ?)",
@@ -614,6 +648,7 @@ def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending",
     )
     conn.commit()
     return int(cur.lastrowid)
+
 
 # ============================================================
 # TELEGRAM HELPERS
@@ -624,8 +659,10 @@ def hard_clip(text: str, max_len: int = 3800) -> str:
         return text
     return text[: max_len - 20] + "\n\n…(truncated)"
 
+
 def strip_html_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "")
+
 
 async def send_html_safe(bot, chat_id: int, html_text: str) -> None:
     html_text = hard_clip(html_text, 3800)
@@ -641,8 +678,52 @@ async def send_html_safe(bot, chat_id: int, html_text: str) -> None:
         await bot.send_message(
             chat_id=chat_id,
             text=plain,
-            disable_web_page_preview=DISABLE_PREVIEWS,
         )
+
+
+async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "") -> None:
+    """
+    Publishes text + optional image to the given chat/channel.
+    Handles image download/upload fallback.
+    """
+    image_url = (image_url or "").strip()
+
+    # MODE A:
+    # - If we have a usable photo: attach it.
+    # - Otherwise: post text only (no photo).
+    if image_url:
+        try:
+            # Fast path: Telegram fetches URL
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url
+            )
+        except Exception as e_url:
+            msg = str(e_url)
+            # If Telegram can't fetch the URL, upload bytes ourselves
+            if "failed to get http url content" in msg.lower():
+                try:
+                    data, fname = download_image_bytes(image_url)
+                    bio = BytesIO(data)
+                    bio.name = fname
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=InputFile(bio, filename=fname)
+                    )
+                except Exception:
+                    # If image upload fails, just continue with text only
+                    pass
+            else:
+                # Any other photo failure -> continue with text only
+                pass
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=hard_clip(text, 3900),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=DISABLE_PREVIEWS
+    )
+
 
 def make_clickable_read_link(url: str) -> str:
     u = (url or "").strip()
@@ -651,14 +732,34 @@ def make_clickable_read_link(url: str) -> str:
     u_esc = html.escape(u, quote=True)
     return f'<a href="{u_esc}">Читать</a>'
 
-def build_message_html(headline: str, summary: str, details: str, source: str, link: str, rss_title: str, rss_summary: str) -> str:
+
+def build_message_html(headline: str, summary: str, details: str, source: str, link: str, rss_title: str,
+                       rss_summary: str, ai_hashtags: list[str] = None) -> str:
     h = html.escape((headline or "").strip())
     s = html.escape((summary or "").strip())
     d = html.escape((details or "").strip())
     src = html.escape((source or "").strip())
     read = make_clickable_read_link(link)
 
-    hashtags = " ".join(pick_hashtags(rss_title, rss_summary, source))
+    # Use AI hashtags if available, otherwise fall back to old logic
+    if ai_hashtags:
+        # Ensure #Швеция and #Новости are always present
+        core = set(HASHTAG_CORE)
+        final_tags = []
+        # Add AI tags first
+        for t in ai_hashtags:
+            if not t.startswith("#"):
+                t = "#" + t
+            final_tags.append(t)
+
+        # Add core tags if missing
+        for c in HASHTAG_CORE:
+            if c not in final_tags:
+                final_tags.append(c)
+
+        hashtags = " ".join(final_tags[:12])  # safe cap
+    else:
+        hashtags = " ".join(pick_hashtags(rss_title, rss_summary, source))
 
     return (
         f"{h}\n\n"
@@ -670,11 +771,13 @@ def build_message_html(headline: str, summary: str, details: str, source: str, l
         f"{html.escape(TELEGRAM_HANDLE)}"
     )
 
+
 # ============================================================
 # OPENAI
 # ============================================================
 
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
 
 def is_russian_enough(text: str) -> bool:
     letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text or "")
@@ -683,14 +786,18 @@ def is_russian_enough(text: str) -> bool:
     cyr = sum(1 for ch in letters if CYRILLIC_RE.match(ch))
     return (cyr / len(letters)) >= 0.80
 
+
 def has_latin_words(text: str) -> bool:
     return bool(re.search(r"\b[A-Za-z]{2,}\b", text or ""))
+
 
 def extract_block(raw: str, label: str) -> str:
     m = re.search(rf"{label}:\s*\n(.*?)(?=\n[A-Z]+:\s*\n|\Z)", raw, flags=re.S)
     return (m.group(1).strip() if m else "")
 
+
 RATE_WAIT_RE = re.compile(r"try again in\s+(\d+)m(\d+(?:\.\d+)?)s", re.I)
+
 
 def parse_rate_limit_wait_seconds(msg: str) -> int:
     m = RATE_WAIT_RE.search(msg or "")
@@ -700,18 +807,22 @@ def parse_rate_limit_wait_seconds(msg: str) -> int:
     seconds = float(m.group(2))
     return max(10, int(minutes * 60 + seconds) + 3)
 
-def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summary: str, link: str, article_type: str) -> str:
+
+def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summary: str, link: str,
+                               article_type: str) -> str:
     if article_type == "news":
         format_rules = (
             "- HEADLINE: 1 line, starts with exactly 1 emoji, 6–14 words.\n"
-            "- SUMMARY: 2–4 sentences, 50–90 words.\n"
-            "- DETAILS: 6–10 short lines, 700–1200 characters.\n"
+            "- SUMMARY: 2–4 sentences, 70–110 words.\n"
+            "- DETAIL: 8–12 short lines, 900–1600 characters.\n"
+            "- HASHTAGS: 3-6 space-separated tags (e.g. #Sweden #News).\n"
         )
     else:
         format_rules = (
             "- HEADLINE: 1 line, starts with exactly 1 emoji, 6–14 words.\n"
-            "- SUMMARY: 2 short paragraphs, 70–140 words total.\n"
-            "- DETAILS: 8–12 short lines, 900–1600 characters.\n"
+            "- SUMMARY: 2 short paragraphs, 80–150 words total.\n"
+            "- DETAILS: 10–14 short lines, 1000–1800 characters.\n"
+            "- HASHTAGS: 3-6 space-separated tags.\n"
         )
 
     prompt = f"""
@@ -722,7 +833,7 @@ def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summ
 - Не выдумывай факты. Используй только то, что есть в заголовке/описании RSS.
 - Не цитируй дословно.
 - Никакого Markdown/HTML. Обычный текст.
-- Верни РОВНО 3 блока с точными метками: HEADLINE / SUMMARY / DETAILS.
+- Верни РОВНО 4 блока с точными метками: HEADLINE / SUMMARY / DETAILS / HASHTAGS.
 - Никаких других строк до/после блоков.
 
 HEADLINE:
@@ -732,6 +843,9 @@ SUMMARY:
 ...
 
 DETAILS:
+...
+
+HASHTAGS:
 ...
 
 Требования:
@@ -746,7 +860,8 @@ DETAILS:
     r = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Return Russian only. Exactly 3 blocks with HEADLINE/SUMMARY/DETAILS labels."},
+            {"role": "system",
+             "content": "Return Russian only. Exactly 4 blocks: HEADLINE, SUMMARY, DETAILS, HASHTAGS."},
             {"role": "user", "content": prompt},
         ],
         temperature=OPENAI_TEMPERATURE,
@@ -754,10 +869,12 @@ DETAILS:
     )
     return (r.choices[0].message.content or "").strip()
 
-def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, article_type: str) -> tuple[str, str, str]:
+
+def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, article_type: str) -> tuple[
+    str, str, str, list[str]]:
     """
     Guaranteed fallback: translate/compose without requiring block labels.
-    Returns (headline, summary, details) in Russian.
+    Returns (headline, summary, details, hashtags_list) in Russian.
     """
     t = (title or "").strip()
     s = (rss_summary or "").strip()
@@ -771,10 +888,11 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
 
 Сделай:
 1) Заголовок (1 строка) — начни с одного эмодзи.
-2) Краткое резюме (2–4 предложения, 50–90 слов).
-3) Детали (6–10 коротких строк, без ссылок, без HTML/Markdown).
+2) Краткое резюме (2–4 предложения, 70–110 слов).
+3) Детали (8–12 коротких строк, без ссылок, без HTML/Markdown).
+4) Хештеги (3-5 штук через пробел).
 
-Тип: {"новость" if article_type=="news" else "мнение/дебаты"}.
+Тип: {"новость" if article_type == "news" else "мнение/дебаты"}.
 
 Верни в таком виде:
 ЗАГОЛОВОК: ...
@@ -782,6 +900,7 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
 ДЕТАЛИ:
 - ...
 - ...
+ХЕШТЕГИ: ...
 """.strip()
 
     r = client.chat.completions.create(
@@ -801,7 +920,8 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
 
     m1 = re.search(r"ЗАГОЛОВОК:\s*(.+)", raw)
     m2 = re.search(r"РЕЗЮМЕ:\s*(.+)", raw)
-    m3 = re.search(r"ДЕТАЛИ:\s*(.*)", raw, flags=re.S)
+    m3 = re.search(r"ДЕТАЛИ:\s*(.+?)(?=\nХЕШТЕГИ:|\Z)", raw, flags=re.S)
+    m4 = re.search(r"ХЕШТЕГИ:\s*(.+)", raw)
 
     if m1:
         headline = m1.group(1).strip()
@@ -810,22 +930,31 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
     if m3:
         details = m3.group(1).strip()
 
+    hashtags = []
+    if m4:
+        tags_raw = m4.group(1).strip()
+        for t in tags_raw.split():
+            clean_t = t.strip("#., ")
+            if clean_t:
+                hashtags.append(clean_t)
+
     details = re.sub(r"^\s*[-•]\s*", "• ", details, flags=re.M).strip()
 
-    if not headline:
-        headline = "📰 Новость"
-    if not summary:
-        summary = "Кратко: подробности уточняются."
-    if not details:
-        details = "• Подробности — по ссылке."
+    # Clean up details if hashtags got stuck in there
+    details = details.split("ХЕШТЕГИ:")[0].strip()
+
+    details = re.sub(r"^\s*[-•]\s*", "• ", details, flags=re.M).strip()
+
+    # Fallback to raising error instead of placeholders
+    if not headline or not summary or not details:
+        raise ValueError("OpenAI response missing HEADLINE, SUMMARY, or DETAILS.")
 
     joined = f"{headline}\n{summary}\n{details}"
     if not is_russian_enough(joined) or has_latin_words(joined):
-        headline = "📰 Новость"
-        summary = "Кратко: подробности уточняются."
-        details = "• Подробности — по ссылке."
+        raise ValueError("OpenAI response was not consistent Russian or contained too much Latin.")
 
-    return headline, summary, details
+    return headline, summary, details, hashtags
+
 
 def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> str:
     rss_summary = strip_html_text(rss_summary_raw)
@@ -833,21 +962,41 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
     raw = openai_strict_three_blocks(client, source, title, rss_summary, link, article_type)
 
     has_labels = (
-        re.search(r"\bHEADLINE:\s*\n", raw) and
-        re.search(r"\bSUMMARY:\s*\n", raw) and
-        re.search(r"\bDETAILS:\s*\n", raw)
+            re.search(r"\bHEADLINE:\s*\n", raw) and
+            re.search(r"\bSUMMARY:\s*\n", raw) and
+            re.search(r"\bDETAILS:\s*\n", raw)
     )
 
     if has_labels:
         headline = extract_block(raw, "HEADLINE")
         summ = extract_block(raw, "SUMMARY")
         details = extract_block(raw, "DETAILS")
+        hashtags_raw = extract_block(raw, "HASHTAGS")
+
+        ai_hashtags = []
+        if hashtags_raw:
+            for t in hashtags_raw.split():
+                clean_t = t.strip("#., ")
+                if clean_t:
+                    ai_hashtags.append(clean_t)
 
         if headline and summ and details and is_russian_enough(raw) and not has_latin_words(raw):
-            return build_message_html(headline, summ, details, source, link, rss_title=title, rss_summary=rss_summary)
+            # Check length to prevent "ultra short" posts
+            if len(headline + summ + details) < 400:
+                pass
+            else:
+                return build_message_html(headline, summ, details, source, link, rss_title=title,
+                                          rss_summary=rss_summary, ai_hashtags=ai_hashtags)
 
-    headline, summ, details = openai_translate_compose(client, title, rss_summary, article_type)
-    return build_message_html(headline, summ, details, source, link, rss_title=title, rss_summary=rss_summary)
+    headline, summ, details, ai_hashtags = openai_translate_compose(client, title, rss_summary, article_type)
+
+    # Final length check
+    if len(headline + summ + details) < 400:
+        raise ValueError(f"Generated content too short ({len(headline + summ + details)} chars).")
+
+    return build_message_html(headline, summ, details, source, link, rss_title=title, rss_summary=rss_summary,
+                              ai_hashtags=ai_hashtags)
+
 
 # ============================================================
 # RSS RUN
@@ -941,25 +1090,45 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
             continue
 
-        draft_id = save_draft(conn, msg_html, status="pending", image_url=image_url)
-        editor_payload = f"📝 Draft #{draft_id}\n\n{msg_html}\n\n/post {draft_id} | /skip {draft_id}"
+        if AUTO_POST:
+            # Auto-post immediately
+            draft_id = save_draft(conn, msg_html, status="posted", image_url=image_url)
+            try:
+                await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url)
+                print(f"[AUTO] posted draft #{draft_id} for {source}", flush=True)
 
-        try:
-            await send_html_safe(bot, EDITOR_CHAT_ID, editor_payload)
-        except Exception as te:
-            dropped += 1
-            err = f"telegram_send_failed: {te}"
-            print(f"[DROP] send editor {source}: {err}", flush=True)
-            save_failure(conn, source, item_id, "send_editor", err)
-            conn.execute("UPDATE drafts SET status='failed', error=? WHERE id=?", (err[:2000], draft_id))
-            conn.commit()
-            continue
+                # Optional: log to editor chat
+                await bot.send_message(chat_id=EDITOR_CHAT_ID, text=f"🚀 Auto-posted #{draft_id} from {source}")
+            except Exception as pe:
+                dropped += 1
+                err = f"autopost_failed: {pe}"
+                print(f"[DROP] autopost {source}: {err}", flush=True)
+                save_failure(conn, source, item_id, "autopost", err)
+                conn.execute("UPDATE drafts SET status='failed', error=? WHERE id=?", (err[:2000], draft_id))
+                conn.commit()
+                continue
+        else:
+            # Manual approval flow
+            draft_id = save_draft(conn, msg_html, status="pending", image_url=image_url)
+            editor_payload = f"📝 Draft #{draft_id}\n\n{msg_html}\n\n/post {draft_id} | /skip {draft_id}"
+
+            try:
+                await send_html_safe(bot, EDITOR_CHAT_ID, editor_payload)
+            except Exception as te:
+                dropped += 1
+                err = f"telegram_send_failed: {te}"
+                print(f"[DROP] send editor {source}: {err}", flush=True)
+                save_failure(conn, source, item_id, "send_editor", err)
+                conn.execute("UPDATE drafts SET status='failed', error=? WHERE id=?", (err[:2000], draft_id))
+                conn.commit()
+                continue
 
         mark_posted(conn, item_id)
         produced += 1
         await asyncio.sleep(1.0)
 
     print(f"[RSS] produced={produced} dropped={dropped} candidates={len(candidates)} (reason={reason})", flush=True)
+
 
 # ============================================================
 # JOB + COMMANDS
@@ -973,12 +1142,14 @@ async def rss_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         print(f"[RSS] job error: {e}", flush=True)
 
+
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     await update.message.reply_text("🔄 Running RSS now…")
     await run_rss_once(context.application, reason="manual")
     await update.message.reply_text("✅ RSS run complete.")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -1012,7 +1183,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- drafts: pending={pending} posted={posted} failed={failed}\n"
         f"- failures table: {failures}\n"
         f"- previews_disabled: {DISABLE_PREVIEWS}\n"
+        f"- AUTO_POST: {AUTO_POST}\n"
     )
+
 
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -1031,6 +1204,7 @@ async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     finally:
         conn.close()
+
 
 async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -1055,41 +1229,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         image_url = (image_url or "").strip()
 
-        # MODE A:
-        # - If we have a usable photo: attach it.
-        # - Otherwise: post text only (no photo).
-        if image_url:
-            try:
-                # Fast path: Telegram fetches URL
-                await context.bot.send_photo(
-                    chat_id=PUBLIC_CHANNEL_ID,
-                    photo=image_url
-                )
-            except Exception as e_url:
-                msg = str(e_url)
-                # If Telegram can't fetch the URL, upload bytes ourselves
-                if "failed to get http url content" in msg.lower():
-                    try:
-                        data, fname = download_image_bytes(image_url)
-                        bio = BytesIO(data)
-                        bio.name = fname
-                        await context.bot.send_photo(
-                            chat_id=PUBLIC_CHANNEL_ID,
-                            photo=InputFile(bio, filename=fname)
-                        )
-                    except Exception:
-                        # If image upload fails, just continue with text only
-                        pass
-                else:
-                    # Any other photo failure -> continue with text only
-                    pass
-
-        await context.bot.send_message(
-            chat_id=PUBLIC_CHANNEL_ID,
-            text=hard_clip(text, 3900),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=DISABLE_PREVIEWS
-        )
+        await publish_to_channel(context.bot, PUBLIC_CHANNEL_ID, text, image_url)
 
         c.execute("UPDATE drafts SET status='posted' WHERE id=?", (did,))
         conn.commit()
@@ -1098,6 +1238,7 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Channel post failed: {e}")
     finally:
         conn.close()
+
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -1114,6 +1255,7 @@ async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑 Skipped draft #{did}")
     finally:
         conn.close()
+
 
 # ============================================================
 # INIT + MAIN
@@ -1141,6 +1283,7 @@ async def post_init(app: Application) -> None:
         name="rss_tick"
     )
 
+
 def main():
     acquire_lock_or_exit()
     print(f"[BOOT] env ok. job_tick={JOB_TICK_SECONDS}s db={DB_PATH}", flush=True)
@@ -1164,6 +1307,7 @@ def main():
         except Exception:
             pass
         release_lock()
+
 
 if __name__ == "__main__":
     main()

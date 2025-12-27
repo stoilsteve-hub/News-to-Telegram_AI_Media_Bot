@@ -1449,7 +1449,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 logger.debug(f"[RSS] skipping similar (to DB): {title} ({source})")
                 continue
 
-            if not await verify_link(client, link):
+            if not await verify_link(http_client, link):
                 logger.info(f"[RSS] skipping dead link: {link} ({source})")
                 continue
 
@@ -1511,7 +1511,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             if "rate limit" in msg.lower() or "429" in msg:
                 wait = parse_rate_limit_wait_seconds(msg)
                 app.bot_data["next_ai_time"] = time.time() + wait
-                print(f"[RATE LIMIT] pausing AI for {wait}s", flush=True)
+                logger.warning(f"[RATE LIMIT] pausing AI for {wait}s")
                 try:
                     await bot.send_message(
                         chat_id=EDITOR_CHAT_ID,
@@ -1524,11 +1524,11 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
 
             # FINAL fallback: brief mode
             try:
-                msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
-                print(f"[FALLBACK] brief mode used for {source} due to: {ex}", flush=True)
+                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, summ, link)
+                logger.info(f"[FALLBACK] brief mode used for {source} due to: {ex}")
             except Exception as ex2:
                 dropped += 1
-                print(f"[DROP] {source}: {ex} / fallback_failed: {ex2}", flush=True)
+                logger.error(f"[DROP] {source}: {ex} / fallback_failed: {ex2}")
                 save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
                 continue
 

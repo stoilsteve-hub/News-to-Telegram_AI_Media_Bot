@@ -5,11 +5,12 @@ import time
 import sqlite3
 import asyncio
 import difflib
+import logging
 import traceback
 from io import BytesIO
 from urllib.parse import quote_plus, urljoin, urlparse
 
-import requests
+import httpx
 import feedparser
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -18,6 +19,17 @@ from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%G-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("SwedishWallBot")
 
 # ============================================================
 # ENV
@@ -157,9 +169,33 @@ def detect_article_type(source_name: str, title: str, link: str) -> str:
     return "news"
 
 
-def fetch_feed(url: str) -> feedparser.FeedParserDict:
-    resp = requests.get(url, timeout=20, headers={"User-Agent": feedparser.USER_AGENT})
-    resp.raise_for_status()
+async def safe_get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """Robust GET with retries for transient errors."""
+    retries = 3
+    backoff = 1.5
+    for i in range(retries):
+        try:
+            resp = await client.get(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            if i == retries - 1:
+                raise
+            wait = backoff * (2 ** i)
+            logger.warning(f"[RETRY] {url} failed ({e}), waiting {wait:.1f}s...")
+            await asyncio.sleep(wait)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500 and i < retries - 1:
+                wait = backoff * (2 ** i)
+                logger.warning(f"[RETRY] {url} status {e.response.status_code}, waiting {wait:.1f}s...")
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise httpx.RequestError("Max retries exceeded", request=None)
+
+
+async def fetch_feed(client: httpx.AsyncClient, url: str) -> feedparser.FeedParserDict:
+    resp = await safe_get(client, url, timeout=20.0)
     return feedparser.parse(resp.content)
 
 
@@ -167,6 +203,18 @@ def extract_item_id(entry) -> str:
     link = (entry.get("link") or "").strip()
     eid = (entry.get("id") or entry.get("guid") or link or "").strip()
     return eid
+
+
+async def verify_link(client: httpx.AsyncClient, url: str) -> bool:
+    """Check if the source URL actually works (200 OK) before processing."""
+    try:
+        resp = await client.head(url, timeout=10.0, follow_redirects=True)
+        if resp.status_code == 405: # HEAD not allowed
+            resp = await client.get(url, timeout=10.0, follow_redirects=True)
+        return resp.status_code < 400
+    except Exception as e:
+        logger.debug(f"Link verification failed for {url}: {e}")
+        return False
 
 
 def strip_html_text(s: str) -> str:
@@ -195,34 +243,33 @@ META_OG_IMAGE_ALT_RE = re.compile(
 IMG_SRC_RE = re.compile(r"<img[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 
 
-def fetch_article_image(article_url: str) -> str:
+async def fetch_article_image(client: httpx.AsyncClient, article_url: str) -> str:
     u = (article_url or "").strip()
     if not u:
         return ""
 
-    resp = requests.get(
-        u,
-        timeout=20,
-        headers={
-            "User-Agent": feedparser.USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        allow_redirects=True,
-    )
-    resp.raise_for_status()
-    html_text = resp.text or ""
+    try:
+        resp = await safe_get(
+            client,
+            u,
+            timeout=20.0,
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        )
+        html_text = resp.text or ""
 
-    m = META_OG_IMAGE_RE.search(html_text) or META_OG_IMAGE_ALT_RE.search(html_text)
-    if m:
-        img = (m.group(1) or "").strip()
-        if img:
-            return urljoin(u, img)
+        m = META_OG_IMAGE_RE.search(html_text) or META_OG_IMAGE_ALT_RE.search(html_text)
+        if m:
+            img = (m.group(1) or "").strip()
+            if img:
+                return urljoin(u, img)
 
-    m2 = IMG_SRC_RE.search(html_text)
-    if m2:
-        img = (m2.group(1) or "").strip()
-        if img:
-            return urljoin(u, img)
+        m2 = IMG_SRC_RE.search(html_text)
+        if m2:
+            img = (m2.group(1) or "").strip()
+            if img:
+                return urljoin(u, img)
+    except Exception as e:
+        logger.debug(f"Failed to fetch image from {u}: {e}")
 
     return ""
 
@@ -325,7 +372,7 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
     return (0, 0)
 
 
-def is_usable_image(image_url: str) -> bool:
+async def is_usable_image(client: httpx.AsyncClient, image_url: str) -> bool:
     u = (image_url or "").strip()
     if not u:
         return False
@@ -333,74 +380,67 @@ def is_usable_image(image_url: str) -> bool:
         return False
 
     try:
-        r = requests.get(
+        # Use stream to only probe the header
+        async with client.stream(
+            "GET",
             u,
-            timeout=20,
+            timeout=20.0,
             headers={
-                "User-Agent": feedparser.USER_AGENT,
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 "Referer": u,
             },
-            stream=True,
-            allow_redirects=True,
-        )
-        r.raise_for_status()
-        buf = b""
-        max_probe = 256 * 1024
-        for chunk in r.iter_content(chunk_size=32 * 1024):
-            if not chunk:
-                continue
-            buf += chunk
-            if len(buf) >= max_probe:
-                break
+        ) as r:
+            r.raise_for_status()
+            buf = b""
+            max_probe = 256 * 1024
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) >= max_probe:
+                    break
+                w, h = _image_dimensions_from_bytes(buf)
+                if w and h:
+                    break
+
             w, h = _image_dimensions_from_bytes(buf)
-            if w and h:
-                break
+            if w == 0 or h == 0:
+                return True
 
-        w, h = _image_dimensions_from_bytes(buf)
-        if w == 0 or h == 0:
+            if w < 420 or h < 240:
+                return False
+
+            aspect = w / h if h else 0.0
+            if 0.85 <= aspect <= 1.15 and max(w, h) < 900:
+                return False
+
             return True
-
-        if w < 420 or h < 240:
-            return False
-
-        aspect = w / h if h else 0.0
-        if 0.85 <= aspect <= 1.15 and max(w, h) < 900:
-            return False
-
-        return True
-    except Exception:
+    except Exception as e:
+        logger.debug(f"is_usable_image failed for {u}: {e}")
         return False
 
 
-def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[bytes, str]:
+async def download_image_bytes(client: httpx.AsyncClient, image_url: str, max_bytes: int = 12_000_000) -> tuple[bytes, str]:
     u = (image_url or "").strip()
     if not u:
         raise ValueError("empty image url")
 
-    r = requests.get(
+    async with client.stream(
+        "GET",
         u,
-        timeout=25,
+        timeout=25.0,
         headers={
-            "User-Agent": feedparser.USER_AGENT,
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Referer": u,
         },
-        stream=True,
-        allow_redirects=True,
-    )
-    r.raise_for_status()
-
-    ct = (r.headers.get("Content-Type") or "").lower()
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in r.iter_content(chunk_size=64 * 1024):
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > max_bytes:
-            raise ValueError("image too large")
+    ) as r:
+        r.raise_for_status()
+        ct = (r.headers.get("Content-Type") or "").lower()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in r.aiter_bytes():
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("image too large")
 
     data = b"".join(chunks)
 
@@ -548,6 +588,24 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
+# Tracking sequential failures for Health Alerts
+FEED_HEALTH = {} # {source_name: sequential_failure_count}
+
+
+def backup_db():
+    """Simple daily backup of the database."""
+    import shutil
+    if not os.path.exists(DB_PATH):
+        return
+    backup_name = f"{DB_PATH}.{time.strftime('%Y%m%d')}.bak"
+    if not os.path.exists(backup_name):
+        try:
+            shutil.copy2(DB_PATH, backup_name)
+            logger.info(f"[BACKUP] Created {backup_name}")
+        except Exception as e:
+            logger.error(f"[BACKUP] Failed: {e}")
+
+
 def already_posted(conn: sqlite3.Connection, item_id: str) -> bool:
     c = conn.cursor()
     c.execute("SELECT 1 FROM posted WHERE item_id=?", (item_id,))
@@ -577,6 +635,39 @@ def is_similar(text1: str, text2: str, threshold: float = 0.7) -> bool:
     if t1 == t2:
         return True
     return difflib.SequenceMatcher(None, t1, t2).ratio() >= threshold
+
+
+async def is_semantically_similar(client: OpenAI, new_headline: str, recent_headlines: list[str]) -> bool:
+    """Uses AI to check if a new headline covers the same story as recent ones."""
+    if not recent_headlines:
+        return False
+
+    recent_str = "\n".join([f"- {h}" for h in recent_headlines[:10]])
+    prompt = f"""
+Compare the new headline with the list of recent news headlines below.
+Decide if the new headline is about the same story/event.
+
+Recent headlines:
+{recent_str}
+
+New headline:
+{new_headline}
+
+Respond ONLY with 'YES' if it's the same story, or 'NO' if it's a different story.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        answer = (resp.choices[0].message.content or "").strip().upper()
+        return "YES" in answer
+    except Exception as e:
+        logger.error(f"Semantic deduplication failed: {e}")
+        return False
 
 
 def get_recent_headlines(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
@@ -639,22 +730,28 @@ async def send_html_safe(bot, chat_id: int, html_text: str) -> None:
         await bot.send_message(chat_id=chat_id, text=plain)
 
 
-async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "") -> None:
+async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "", client: httpx.AsyncClient = None) -> None:
     image_url = (image_url or "").strip()
 
-    if image_url:
+    if image_url and client:
         try:
             await bot.send_photo(chat_id=chat_id, photo=image_url)
         except Exception as e_url:
             msg = str(e_url)
             if "failed to get http url content" in msg.lower():
                 try:
-                    data, fname = download_image_bytes(image_url)
+                    data, fname = await download_image_bytes(client, image_url)
                     bio = BytesIO(data)
                     bio.name = fname
                     await bot.send_photo(chat_id=chat_id, photo=InputFile(bio, filename=fname))
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.warning(f"Fallback photo upload failed: {e2}")
+    elif image_url:
+        # Fallback if client is missing (should not happen in main flow)
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=image_url)
+        except Exception:
+            pass
 
     await bot.send_message(
         chat_id=chat_id,
@@ -1015,7 +1112,41 @@ def openai_rewrite_russian_only(client: OpenAI, headline: str, summary: str, det
     return nh, ns, nd
 
 
-def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> tuple[str, str]:
+async def verify_facts(client: OpenAI, swedish_title: str, swedish_summary: str, russian_content: str) -> bool:
+    """Cross-references Russian summary against Swedish source to catch hallucinations."""
+    prompt = f"""
+Verify if the Russian summary below contains any factual contradictions or hallucinations compared to the original Swedish source.
+Common errors to check: names, dates, numbers, sports scores, or swapping of locations/countries.
+
+Swedish source:
+Title: {swedish_title}
+Summary: {swedish_summary}
+
+Russian content:
+{russian_content}
+
+Does the Russian content contain factual errors OR info NOT present in Swedish source?
+Respond ONLY with 'VALID' if it is correct, or 'ERROR: <reason>' if there is a factual issue.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=60,
+        )
+        answer = (resp.choices[0].message.content or "").strip().upper()
+        if "VALID" in answer:
+            return True
+        logger.warning(f"[FACT CHECK] Failed: {answer}")
+        return False
+    except Exception as e:
+        logger.error(f"Fact verification failed: {e}")
+        return True # Default to True to avoid blocking on API errors
+
+
+async def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> tuple[str, str]:
     rss_summary = strip_html_text(rss_summary_raw)
 
     raw = openai_strict_blocks(client, source, title, rss_summary, link, article_type)
@@ -1100,6 +1231,14 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
         rss_summary=rss_summary,
         ai_hashtags=ai_hashtags
     )
+
+    # Optional fact check if enabled/requested
+    if not await verify_facts(client, title, rss_summary, f"{headline}\n{summ}\n{details}"):
+        # One last attempt to rewrite if facts failed
+        rh, rs, rd = openai_rewrite_russian_only(client, headline, summ, details)
+        msg_html = build_message_html(rh, rs, rd, source, link, title, rss_summary, ai_hashtags)
+        return msg_html, rh
+
     return msg_html, headline
 
 
@@ -1159,7 +1298,7 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
     return ru_title, ru_teaser
 
 
-def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str) -> tuple[str, str]:
+async def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str) -> tuple[str, str]:
     teaser_src = strip_html_text(rss_summary_raw or "").strip()
 
     ru_title, ru_teaser = translate_brief_to_russian(client, title, teaser_src)
@@ -1195,7 +1334,7 @@ def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_sum
 IS_FREE_RE = re.compile(r'"isAccessibleForFree"\s*:\s*(true|false)', re.I)
 
 
-def detect_is_accessible_for_free(article_url: str) -> bool | None:
+async def detect_is_accessible_for_free(client: httpx.AsyncClient, article_url: str) -> bool | None:
     """
     Returns:
       True  -> explicitly free
@@ -1206,26 +1345,19 @@ def detect_is_accessible_for_free(article_url: str) -> bool | None:
     if not u:
         return None
     try:
-        resp = requests.get(
-            u,
-            timeout=20,
-            headers={
-                "User-Agent": feedparser.USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-            allow_redirects=True,
-        )
+        resp = await client.get(u, timeout=20.0)
         resp.raise_for_status()
         txt = resp.text or ""
         m = IS_FREE_RE.search(txt)
         if not m:
             return None
         return m.group(1).lower() == "true"
-    except Exception:
+    except Exception as e:
+        logger.debug(f"detect_is_accessible_for_free failed for {u}: {e}")
         return None
 
 
-def is_paywalled_like(source: str, link: str, rss_summary_raw: str = "") -> bool:
+async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, rss_summary_raw: str = "") -> bool:
     """
     DN: always paywalled (per requirement).
     Aftonbladet/Expressen: check schema.org isAccessibleForFree if possible.
@@ -1245,7 +1377,7 @@ def is_paywalled_like(source: str, link: str, rss_summary_raw: str = "") -> bool
     is_thin = len(summ_clean) < 180
 
     if host.endswith("aftonbladet.se") or host.endswith("expressen.se"):
-        free_flag = detect_is_accessible_for_free(link)
+        free_flag = await detect_is_accessible_for_free(client, link)
         if free_flag is True:
             return False
         if free_flag is False:
@@ -1280,10 +1412,22 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
     candidates = []
     for source, url in RSS_FEEDS:
         try:
-            feed = fetch_feed(url)
+            feed = await fetch_feed(client, url)
+            FEED_HEALTH[source] = 0 # Reset on success
         except Exception as e:
-            print(f"[RSS] fetch failed {source}: {e}", flush=True)
+            logger.error(f"[RSS] fetch failed {source}: {e}")
             save_failure(conn, source, "", "fetch_feed", str(e))
+            
+            # Health Alert logic
+            FEED_HEALTH[source] = FEED_HEALTH.get(source, 0) + 1
+            if FEED_HEALTH[source] == 5:
+                try:
+                    await bot.send_message(
+                        chat_id=EDITOR_CHAT_ID,
+                        text=f"⚠️ Health Alert: Feed '{source}' has failed 5 times in a row. Please check the source URL/layout."
+                    )
+                except Exception:
+                    pass
             continue
 
         for entry in (feed.entries or [])[:PER_FEED_CAP]:
@@ -1301,7 +1445,11 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 continue
 
             if any(is_similar(title, rt) for rt in recent_titles):
-                print(f"[RSS] skipping similar (to DB): {title} ({source})", flush=True)
+                logger.debug(f"[RSS] skipping similar (to DB): {title} ({source})")
+                continue
+
+            if not await verify_link(client, link):
+                logger.info(f"[RSS] skipping dead link: {link} ({source})")
                 continue
 
             candidates.append((s, source, title, summ, link, item_id))
@@ -1331,19 +1479,19 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         # Image extraction
         image_url = ""
         try:
-            image_url = fetch_article_image(link)
+            image_url = await fetch_article_image(client, link)
         except Exception as ie:
-            print(f"[IMG] fetch failed {source}: {ie}", flush=True)
+            logger.error(f"[IMG] fetch failed {source}: {ie}")
             save_failure(conn, source, item_id, "fetch_image", str(ie))
             image_url = ""
 
-        if image_url and not is_usable_image(image_url):
+        if image_url and not await is_usable_image(client, image_url):
             image_url = ""
 
         # Paywall logic (fixed)
         summ_clean = strip_html_text(summ or "")
         is_thin = len(summ_clean) < 180
-        paywalled = is_paywalled_like(source, link, summ)
+        paywalled = await is_paywalled_like(client, source, link, summ)
 
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
@@ -1353,9 +1501,9 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
 
         try:
             if use_brief:
-                msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
+                msg_html, generated_headline = await build_brief_message_html_ru(client, source, title, summ, link)
             else:
-                msg_html, generated_headline = generate_post(client, source, title, summ, link, article_type)
+                msg_html, generated_headline = await generate_post(client, source, title, summ, link, article_type)
         except Exception as ex:
             msg = str(ex)
 
@@ -1383,41 +1531,47 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
                 continue
 
-        # Headline dedup
         if any(is_similar(generated_headline, rh) for rh in recent_headlines):
-            print(f"[RSS] skipping similar generated headline: {generated_headline} ({source})", flush=True)
+            logger.debug(f"[RSS] skipping similar generated headline (string match): {generated_headline} ({source})")
+            dropped += 1
+            continue
+
+        if await is_semantically_similar(app.bot_data["openai_client"], generated_headline, recent_headlines):
+            logger.info(f"[RSS] skipping semantically similar headline: {generated_headline} ({source})")
             dropped += 1
             continue
 
         if AUTO_POST:
             draft_id = save_draft(conn, msg_html, status="posted", image_url=image_url)
             try:
-                await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url)
-                print(f"[AUTO] posted draft #{draft_id} for {source}", flush=True)
+                await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url, client=client)
+                logger.info(f"[AUTO] posted draft #{draft_id} for {source}")
                 await bot.send_message(chat_id=EDITOR_CHAT_ID, text=f"🚀 Auto-posted #{draft_id} from {source}")
+                # Transaction safety: mark as posted AFTER success
+                mark_posted(conn, item_id, title=title, headline=generated_headline)
             except Exception as pe:
                 dropped += 1
                 err = f"autopost_failed: {pe}"
-                print(f"[DROP] autopost {source}: {err}", flush=True)
+                logger.error(f"[DROP] autopost {source}: {err}")
                 save_failure(conn, source, item_id, "autopost", err)
                 conn.execute("UPDATE drafts SET status='failed', error=? WHERE id=?", (err[:2000], draft_id))
                 conn.commit()
                 continue
         else:
             draft_id = save_draft(conn, msg_html, status="pending", image_url=image_url)
+            mark_posted(conn, item_id, title=title, headline=generated_headline) # For pending, still mark as "seen" item_id
             editor_payload = f"📝 Draft #{draft_id}\n\n{msg_html}\n\n/post {draft_id} | /skip {draft_id}"
             try:
                 await send_html_safe(bot, EDITOR_CHAT_ID, editor_payload)
             except Exception as te:
                 dropped += 1
                 err = f"telegram_send_failed: {te}"
-                print(f"[DROP] send editor {source}: {err}", flush=True)
+                logger.error(f"[DROP] send editor {source}: {err}")
                 save_failure(conn, source, item_id, "send_editor", err)
                 conn.execute("UPDATE drafts SET status='failed', error=? WHERE id=?", (err[:2000], draft_id))
                 conn.commit()
                 continue
 
-        mark_posted(conn, item_id, title=title, headline=generated_headline)
         produced += 1
         await asyncio.sleep(1.0)
 
@@ -1522,7 +1676,8 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_url = (image_url or "").strip()
-        await publish_to_channel(context.bot, PUBLIC_CHANNEL_ID, text, image_url)
+        client = context.application.bot_data.get("http_client")
+        await publish_to_channel(context.bot, PUBLIC_CHANNEL_ID, text, image_url, client=client)
 
         c.execute("UPDATE drafts SET status='posted' WHERE id=?", (did,))
         conn.commit()
@@ -1560,6 +1715,12 @@ async def post_init(app: Application) -> None:
 
     app.bot_data["openai_client"] = OpenAI(api_key=OPENAI_API_KEY)
     app.bot_data["db_conn"] = init_db()
+    backup_db() # Daily backup on startup
+    app.bot_data["http_client"] = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        follow_redirects=True,
+        headers={"User-Agent": feedparser.USER_AGENT}
+    )
     app.bot_data["next_ai_time"] = 0.0
     app.bot_data["last_run_time"] = 0.0
 
@@ -1581,9 +1742,19 @@ async def post_init(app: Application) -> None:
 
 
 def main():
+    import signal
     acquire_lock_or_exit()
-    print(f"[BOOT] env ok. job_tick={JOB_TICK_SECONDS}s db={DB_PATH}", flush=True)
-    print("[BOOT] polling telegram…", flush=True)
+
+    def handle_exit(sig, frame):
+        logger.info(f"Received exit signal {sig}. Closing bot...")
+        release_lock()
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    logger.info(f"[BOOT] env ok. job_tick={JOB_TICK_SECONDS}s db={DB_PATH}")
+    logger.info("[BOOT] polling telegram…")
 
     request = HTTPXRequest(
         connect_timeout=30.0,
@@ -1607,6 +1778,12 @@ def main():
             conn = app.bot_data.get("db_conn")
             if conn:
                 conn.close()
+        except Exception:
+            pass
+        try:
+            client = app.bot_data.get("http_client")
+            if client:
+                asyncio.run(client.aclose())
         except Exception:
             pass
         release_lock()

@@ -45,7 +45,7 @@ OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
 
 DB_PATH = os.path.join(BASE_DIR, "posted_items.sqlite")
 
-# turn OFF previews so Telegram doesn't show page snippets
+# Turn OFF Telegram web previews
 DISABLE_PREVIEWS = True
 AUTO_POST = (os.getenv("AUTO_POST", "false").lower().strip() == "true")
 
@@ -107,13 +107,15 @@ def google_news_rss(q: str) -> str:
 
 RSS_FEEDS = [
     ("SVT Nyheter", "https://www.svt.se/nyheter/rss.xml"),
+    ("SR Ekot", "https://api.sr.se/api/rss/pod/3795"),
+    ("8 Sidor", "https://8sidor.se/feed/"),
     ("Expressen Nyheter", "https://feeds.expressen.se/nyheter/"),
     ("Government.se via Google", google_news_rss("site:government.se")),
     ("TV4.se via Google", google_news_rss("site:tv4.se")),
     ("Expressen Debatt", "https://feeds.expressen.se/debatt/"),
     ("Aftonbladet", "https://rss.aftonbladet.se/rss2/small/pages/sections/senastenytt/"),
-    # Optional: add DN via Google News if you want DN items more reliably:
-    ("DN via Google", google_news_rss("site:dn.se")),
+    # Optional DN coverage:
+    # ("DN via Google", google_news_rss("site:dn.se")),
 ]
 
 KEYWORDS = [
@@ -193,13 +195,6 @@ IMG_SRC_RE = re.compile(r"<img[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 
 
 def fetch_article_image(article_url: str) -> str:
-    """
-    Best-effort image extraction from article HTML.
-    Priority:
-      1) og:image / twitter:image
-      2) first <img src="...">
-    Returns "" if not found.
-    """
     u = (article_url or "").strip()
     if not u:
         return ""
@@ -229,7 +224,6 @@ def fetch_article_image(article_url: str) -> str:
             return urljoin(u, img)
 
     return ""
-
 
 # ============================================================
 # IMAGE FILTERING (Mode A: if not usable -> no image)
@@ -274,10 +268,6 @@ def _looks_like_logo_url(image_url: str) -> bool:
 
 
 def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
-    """
-    Returns (w,h) or (0,0) if unknown.
-    Handles PNG/JPEG/GIF/WEBP enough for filtering.
-    """
     if not data or len(data) < 16:
         return (0, 0)
 
@@ -293,16 +283,15 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
         h = int.from_bytes(data[8:10], "little", signed=False)
         return (w, h)
 
-    # WEBP (RIFF....WEBP)
+    # WEBP
     if data[:4] == b"RIFF" and len(data) >= 30 and data[8:12] == b"WEBP":
-        # VP8X chunk gives dimensions (most reliable)
         if data[12:16] == b"VP8X" and len(data) >= 30:
             w = 1 + int.from_bytes(data[24:27], "little", signed=False)
             h = 1 + int.from_bytes(data[27:30], "little", signed=False)
             return (w, h)
         return (0, 0)
 
-    # JPEG: scan for SOF markers
+    # JPEG
     if data.startswith(b"\xff\xd8"):
         i = 2
         n = len(data)
@@ -312,11 +301,9 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
                 continue
             marker = data[i + 1]
             i += 2
-            # skip padding FFs
             while marker == 0xFF and i < n:
                 marker = data[i]
                 i += 1
-            # standalone markers
             if marker in (0xD8, 0xD9):
                 continue
             if i + 2 > n:
@@ -324,11 +311,10 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
             seglen = int.from_bytes(data[i:i + 2], "big", signed=False)
             if seglen < 2 or i + seglen > n:
                 break
-            # SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15
             if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
                 if i + 7 <= n:
-                    h = int.from_bytes(data[i + 3:i + 5], "big", signed=False)
-                    w = int.from_bytes(data[i + 5:i + 7], "big", signed=False)
+                    h = int.from_bytes(data[i + 3:i +  5], "big", signed=False)
+                    w = int.from_bytes(data[i + 5:i +  7], "big", signed=False)
                     return (w, h)
                 break
             i += seglen
@@ -338,19 +324,12 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
 
 
 def is_usable_image(image_url: str) -> bool:
-    """
-    Mode A filter:
-    - Reject obvious logos/placeholders by URL.
-    - Reject too-small images (common for logos/icons).
-    """
     u = (image_url or "").strip()
     if not u:
         return False
-
     if _looks_like_logo_url(u):
         return False
 
-    # Download up to a small cap just to read dimensions.
     try:
         r = requests.get(
             u,
@@ -365,7 +344,7 @@ def is_usable_image(image_url: str) -> bool:
         )
         r.raise_for_status()
         buf = b""
-        max_probe = 256 * 1024  # 256KB is usually enough
+        max_probe = 256 * 1024
         for chunk in r.iter_content(chunk_size=32 * 1024):
             if not chunk:
                 continue
@@ -378,33 +357,21 @@ def is_usable_image(image_url: str) -> bool:
 
         w, h = _image_dimensions_from_bytes(buf)
         if w == 0 or h == 0:
-            # If we can't parse dims, allow it (better to keep photos than drop them).
             return True
 
-        # Basic "looks like a real article photo" gate
         if w < 420 or h < 240:
             return False
 
-        # Many logos are near-square; photos usually aren't.
         aspect = w / h if h else 0.0
         if 0.85 <= aspect <= 1.15 and max(w, h) < 900:
             return False
 
         return True
     except Exception:
-        # If probing fails, err on "no image" (safer: avoids broken posts).
         return False
 
 
-# ============================================================
-# DOWNLOAD IMAGE BYTES (so Telegram doesn't need to fetch the URL)
-# ============================================================
-
 def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[bytes, str]:
-    """
-    Downloads image bytes. Returns (bytes, filename).
-    Raises on non-image content or too-large downloads.
-    """
     u = (image_url or "").strip()
     if not u:
         raise ValueError("empty image url")
@@ -435,12 +402,10 @@ def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[b
 
     data = b"".join(chunks)
 
-    # Validate type lightly
     if "image" not in ct:
         if not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG") or data[:4] == b"RIFF" or data[:4] == b"GIF8"):
             raise ValueError(f"not an image (content-type={ct or 'unknown'})")
 
-    # Filename guess
     ext = ".jpg"
     if "png" in ct or data.startswith(b"\x89PNG"):
         ext = ".png"
@@ -455,13 +420,10 @@ def download_image_bytes(image_url: str, max_bytes: int = 12_000_000) -> tuple[b
 
 
 # ============================================================
-# HASHTAGS (core + topic-based, Russian-only, capped)
+# HASHTAGS
 # ============================================================
 
-HASHTAG_CORE = [
-    "#Швеция",
-    "#Новости",
-]
+HASHTAG_CORE = ["#Швеция", "#Новости"]
 
 HASHTAG_TOPICS = {
     "ukraine_russia": ["#Украина", "#Россия", "#Война", "#Безопасность", "#Санкции"],
@@ -485,44 +447,17 @@ HASHTAG_TOPICS = {
 }
 
 TOPIC_TRIGGERS = {
-    "ukraine_russia": [
-        "украин", "киев", "зеленск", "росси", "путин", "войн",
-        "ukraina", "ryssland", "zelensky", "putin", "krig"
-    ],
-    "nato_defense": [
-        "nato", "нато", "обор", "арм", "saab", "gripen",
-        "försvar", "säkerhet", "försvaret", "försvars"
-    ],
-    "politics": [
-        "правитель", "министр", "парламент", "риксдаг", "выбор",
-        "regering", "riksdag", "val", "minister"
-    ],
-    "crime": [
-        "убийств", "взрыв", "стрельб", "насил", "суд", "полици",
-        "brott", "polis", "skjut", "explosion", "våldtäkt", "domstol"
-    ],
-    "migration": [
-        "миграц", "беженц", "убежищ", "депортац",
-        "migration", "asyl", "utvis", "flykting"
-    ],
-    "economy": [
-        "эконом", "инфляц", "цены", "налог", "бюджет",
-        "ekonomi", "inflation", "pris", "skatt", "budget"
-    ],
-    "rates": [
-        "риксбанк", "ставк", "ипотек", "кредит", "процент",
-        "riksbank", "ränta", "lån", "bolån"
-    ],
-    "energy": [
-        "газ", "нефть", "электр", "энерг",
-        "gas", "olja", "elpris", "energi"
-    ],
+    "ukraine_russia": ["украин", "киев", "зеленск", "росси", "путин", "войн", "ukraina", "ryssland", "zelensky", "putin", "krig"],
+    "nato_defense": ["nato", "нато", "обор", "арм", "saab", "gripen", "försvar", "säkerhet", "försvaret", "försvars"],
+    "politics": ["правитель", "министр", "парламент", "риксдаг", "выбор", "regering", "riksdag", "val", "minister"],
+    "crime": ["убийств", "взрыв", "стрельб", "насил", "суд", "полици", "brott", "polis", "skjut", "explosion", "våldtäkt", "domstol"],
+    "migration": ["миграц", "беженц", "убежищ", "депортац", "migration", "asyl", "utvis", "flykting"],
+    "economy": ["эконом", "инфляц", "цены", "налог", "бюджет", "ekonomi", "inflation", "pris", "skatt", "budget"],
+    "rates": ["риксбанк", "ставк", "ипотек", "кредит", "процент", "riksbank", "ränta", "lån", "bolån"],
+    "energy": ["газ", "нефть", "электр", "энерг", "gas", "olja", "elpris", "energi"],
     "eu": ["ес", "евросоюз", "eu", "europarlament"],
     "foreign": ["диплом", "переговор", "посол", "геополит", "utrikes", "diplomati"],
-    "tech": [
-        "кибер", "хакер", "утечк", "ии", "искусственн",
-        "cyber", "hack", "läcka", "ai"
-    ],
+    "tech": ["кибер", "хакер", "утечк", "ии", "искусственн", "cyber", "hack", "läcka", "ai"],
     "health": ["медицин", "больниц", "врач", "covid", "sjukhus", "vård"],
     "education": ["школ", "универс", "student", "skola", "universitet"],
     "society": ["обще", "социал", "пособи", "välfärd", "social"],
@@ -534,11 +469,7 @@ TOPIC_TRIGGERS = {
 
 
 def pick_hashtags(rss_title: str, rss_summary: str, source: str) -> list[str]:
-    """
-    Picks a compact set of relevant hashtags based on RSS text.
-    """
     t = normalize((rss_title or "") + " " + (rss_summary or "") + " " + (source or ""))
-
     tags: list[str] = []
     tags.extend(HASHTAG_CORE)
 
@@ -550,7 +481,6 @@ def pick_hashtags(rss_title: str, rss_summary: str, source: str) -> list[str]:
     for topic in matched_topics[:3]:
         tags.extend(HASHTAG_TOPICS.get(topic, []))
 
-    # Deduplicate preserving order
     seen = set()
     uniq = []
     for tag in tags:
@@ -610,11 +540,9 @@ def init_db() -> sqlite3.Connection:
     """)
     conn.commit()
 
-    # Store parsed image URL (non-breaking migration)
     _ensure_column(conn, "drafts", "image_url", "TEXT")
     _ensure_column(conn, "posted", "title", "TEXT")
     _ensure_column(conn, "posted", "headline", "TEXT")
-
     return conn
 
 
@@ -626,26 +554,18 @@ def already_posted(conn: sqlite3.Connection, item_id: str) -> bool:
 
 def get_recent_titles(conn: sqlite3.Connection, limit: int = 100) -> list[str]:
     c = conn.cursor()
-    c.execute(
-        "SELECT title FROM posted WHERE title IS NOT NULL AND title != '' ORDER BY posted_at DESC LIMIT ?",
-        (limit,)
-    )
+    c.execute("SELECT title FROM posted WHERE title IS NOT NULL AND title != '' ORDER BY posted_at DESC LIMIT ?",
+              (limit,))
     return [row[0] for row in c.fetchall()]
 
 
 def is_similar(text1: str, text2: str, threshold: float = 0.7) -> bool:
-    """Check if two strings are similar using SequenceMatcher."""
     if not text1 or not text2:
         return False
 
     def clean(s: str) -> str:
         s = s.lower().strip()
-        s = re.sub(
-            r"^(expressen|aftonbladet|svt|sr|dn|svd|8 sidor|swedes in russia|sverige|nyheter|radio|ekot)[:\-\s]+",
-            "",
-            s,
-            flags=re.I
-        )
+        s = re.sub(r"^(expressen|aftonbladet|svt|sr|dn|svd|8 sidor|sverige|nyheter|radio|ekot)[:\-\s]+", "", s, flags=re.I)
         s = re.sub(r"[^\w\s]", "", s)
         return s.strip()
 
@@ -654,24 +574,19 @@ def is_similar(text1: str, text2: str, threshold: float = 0.7) -> bool:
         return False
     if t1 == t2:
         return True
-    ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
-    return ratio >= threshold
+    return difflib.SequenceMatcher(None, t1, t2).ratio() >= threshold
 
 
 def get_recent_headlines(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
     c = conn.cursor()
-    c.execute(
-        "SELECT headline FROM posted WHERE headline IS NOT NULL AND headline != '' ORDER BY posted_at DESC LIMIT ?",
-        (limit,)
-    )
+    c.execute("SELECT headline FROM posted WHERE headline IS NOT NULL AND headline != '' ORDER BY posted_at DESC LIMIT ?",
+              (limit,))
     return [row[0] for row in c.fetchall()]
 
 
 def mark_posted(conn: sqlite3.Connection, item_id: str, title: str = "", headline: str = "") -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO posted (item_id, posted_at, title, headline) VALUES (?, ?, ?, ?)",
-        (item_id, utc_now_iso(), title, headline)
-    )
+    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at, title, headline) VALUES (?, ?, ?, ?)",
+                 (item_id, utc_now_iso(), title, headline))
     conn.commit()
 
 
@@ -692,7 +607,6 @@ def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending",
     )
     conn.commit()
     return int(cur.lastrowid)
-
 
 # ============================================================
 # TELEGRAM HELPERS
@@ -723,36 +637,20 @@ async def send_html_safe(bot, chat_id: int, html_text: str) -> None:
 
 
 async def publish_to_channel(bot, chat_id: int, text: str, image_url: str = "") -> None:
-    """
-    Publishes text + optional image to the given chat/channel.
-    Handles image download/upload fallback.
-    """
     image_url = (image_url or "").strip()
 
-    # MODE A:
-    # - If we have a usable photo: attach it.
-    # - Otherwise: post text only (no photo).
     if image_url:
         try:
-            # Fast path: Telegram fetches URL
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=image_url
-            )
+            await bot.send_photo(chat_id=chat_id, photo=image_url)
         except Exception as e_url:
             msg = str(e_url)
-            # If Telegram can't fetch the URL, upload bytes ourselves
             if "failed to get http url content" in msg.lower():
                 try:
                     data, fname = download_image_bytes(image_url)
                     bio = BytesIO(data)
                     bio.name = fname
-                    await bot.send_photo(
-                        chat_id=chat_id,
-                        photo=InputFile(bio, filename=fname)
-                    )
+                    await bot.send_photo(chat_id=chat_id, photo=InputFile(bio, filename=fname))
                 except Exception:
-                    # If image upload fails, just continue with text only
                     pass
 
     await bot.send_message(
@@ -779,7 +677,6 @@ def build_message_html(headline: str, summary: str, details: str, source: str, l
     src = html.escape((source or "").strip())
     read = make_clickable_read_link(link)
 
-    # Use AI hashtags if available, otherwise fall back to old logic
     if ai_hashtags:
         final_tags = []
         for t in ai_hashtags:
@@ -807,10 +704,17 @@ def build_message_html(headline: str, summary: str, details: str, source: str, l
 
 
 # ============================================================
-# OPENAI
+# OPENAI + BULLETPROOF RUSSIAN-ONLY VALIDATION
 # ============================================================
 
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+# Allowlist of Latin tokens that are acceptable (avoid false drops).
+# Keep this SHORT. Add only what you really want to allow.
+LATIN_ALLOWLIST = {
+    "EU", "NATO", "USA", "UN", "WHO", "IMF", "ECB", "SVT", "SR", "DN", "TV4",
+    "G7", "G20", "COVID", "COVID-19", "SEK", "OECD", "OSCE"
+}
 
 
 def is_russian_enough(text: str) -> bool:
@@ -821,8 +725,21 @@ def is_russian_enough(text: str) -> bool:
     return (cyr / len(letters)) >= 0.80
 
 
-def has_latin_words(text: str) -> bool:
-    return bool(re.search(r"\b[A-Za-z]{2,}\b", text or ""))
+def find_latin_words(text: str) -> list[str]:
+    # Capture basic A-Za-z words (including hyphen)
+    words = re.findall(r"\b[A-Za-z][A-Za-z\-]{1,}\b", text or "")
+    return words
+
+
+def has_unwanted_latin(text: str) -> bool:
+    words = find_latin_words(text)
+    if not words:
+        return False
+    for w in words:
+        if w.upper() in LATIN_ALLOWLIST:
+            continue
+        return True
+    return False
 
 
 def extract_block(raw: str, label: str) -> str:
@@ -842,13 +759,12 @@ def parse_rate_limit_wait_seconds(msg: str) -> int:
     return max(10, int(minutes * 60 + seconds) + 3)
 
 
-def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summary: str, link: str,
-                               article_type: str) -> str:
+def openai_strict_blocks(client: OpenAI, source: str, title: str, rss_summary: str, link: str, article_type: str) -> str:
     if article_type == "news":
         format_rules = (
             "- HEADLINE: 1 line, starts with exactly 1 emoji, 6–14 words.\n"
             "- SUMMARY: 2–4 sentences, 70–110 words.\n"
-            "- DETAIL: 8–12 short lines, 900–1600 characters.\n"
+            "- DETAILS: 8–12 short lines, 900–1600 characters.\n"
             "- HASHTAGS: 3-6 space-separated tags.\n"
         )
     else:
@@ -891,15 +807,11 @@ def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summ
 
 
 def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, article_type: str) -> tuple[str, str, str, list[str]]:
-    """
-    Fallback: translate/compose without requiring block labels.
-    Returns (headline, summary, details, hashtags_list) in Russian.
-    """
     t = (title or "").strip()
     s = (rss_summary or "").strip()
 
     prompt = f"""
-Сделай пост на русском (только кириллица), без английских/шведских слов.
+Сделай короткий пост на русском (только кириллица), без английских/шведских слов.
 
 Дано:
 - Заголовок: {t}
@@ -965,16 +877,72 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
         raise ValueError("OpenAI response missing HEADLINE, SUMMARY, or DETAILS.")
 
     joined = f"{headline}\n{summary}\n{details}"
-    if not is_russian_enough(joined) or has_latin_words(joined):
+    if not is_russian_enough(joined) or has_unwanted_latin(joined):
         raise ValueError("OpenAI response was not consistent Russian or contained too much Latin.")
 
     return headline, summary, details, hashtags
 
 
+def openai_rewrite_russian_only(client: OpenAI, headline: str, summary: str, details: str) -> tuple[str, str, str]:
+    """
+    Second-chance rewrite: keep meaning, remove Latin (except allowlist), do NOT add facts.
+    """
+    prompt = f"""
+Перепиши этот текст так, чтобы он был ТОЛЬКО на русском языке (кириллица).
+Разрешены только эти латинские сокращения: {", ".join(sorted(LATIN_ALLOWLIST))}
+
+СТРОГО:
+- Не добавляй факты, цифры, имена, детали, которых нет в тексте.
+- Если встречаются латинские слова (например, названия), замени их на русский эквивалент или транслитерацию кириллицей.
+- Сохрани структуру из 3 частей.
+
+Верни ровно в таком формате:
+ЗАГОЛОВОК: ...
+РЕЗЮМЕ: ...
+ДЕТАЛИ:
+- ...
+- ...
+
+Текст:
+Заголовок: {headline}
+Резюме: {summary}
+Детали: {details}
+""".strip()
+
+    r = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "Russian Cyrillic only except allowlisted acronyms. No new facts."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_tokens=650,
+    )
+    raw = (r.choices[0].message.content or "").strip()
+
+    m1 = re.search(r"ЗАГОЛОВОК:\s*(.+)", raw)
+    m2 = re.search(r"РЕЗЮМЕ:\s*(.+)", raw)
+    m3 = re.search(r"ДЕТАЛИ:\s*(.+)", raw, flags=re.S)
+
+    nh = (m1.group(1).strip() if m1 else "").strip()
+    ns = (m2.group(1).strip() if m2 else "").strip()
+    nd = (m3.group(1).strip() if m3 else "").strip()
+
+    nd = re.sub(r"^\s*[-•]\s*", "• ", nd, flags=re.M).strip()
+
+    joined = f"{nh}\n{ns}\n{nd}"
+    if not nh or not ns or not nd:
+        raise ValueError("rewrite missing sections")
+    if not is_russian_enough(joined) or has_unwanted_latin(joined):
+        raise ValueError("rewrite still has too much Latin")
+
+    return nh, ns, nd
+
+
 def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> tuple[str, str]:
     rss_summary = strip_html_text(rss_summary_raw)
 
-    raw = openai_strict_three_blocks(client, source, title, rss_summary, link, article_type)
+    raw = openai_strict_blocks(client, source, title, rss_summary, link, article_type)
 
     has_labels = (
         re.search(r"\bHEADLINE:\s*\n", raw) and
@@ -982,6 +950,7 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
         re.search(r"\bDETAILS:\s*\n", raw)
     )
 
+    # Try labeled format first
     if has_labels:
         headline = extract_block(raw, "HEADLINE")
         summ = extract_block(raw, "SUMMARY")
@@ -995,41 +964,82 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
                 if clean_t:
                     ai_hashtags.append(clean_t)
 
-        if headline and summ and details and is_russian_enough(raw) and not has_latin_words(raw):
+        joined = f"{headline}\n{summ}\n{details}"
+        if headline and summ and details and is_russian_enough(joined) and not has_unwanted_latin(joined):
             if len(headline + summ + details) >= 400:
                 msg_html = build_message_html(
-                    headline, summ, details, source, link,
-                    rss_title=title, rss_summary=rss_summary, ai_hashtags=ai_hashtags
+                    headline=headline,
+                    summary=summ,
+                    details=details,
+                    source=source,
+                    link=link,
+                    rss_title=title,
+                    rss_summary=rss_summary,
+                    ai_hashtags=ai_hashtags
                 )
                 return msg_html, headline
 
+        # One rewrite retry if Latin leaks
+        if headline and summ and details:
+            try:
+                rh, rs, rd = openai_rewrite_russian_only(client, headline, summ, details)
+                if len(rh + rs + rd) >= 260:  # allow shorter after rewrite
+                    msg_html = build_message_html(
+                        headline=rh,
+                        summary=rs,
+                        details=rd,
+                        source=source,
+                        link=link,
+                        rss_title=title,
+                        rss_summary=rss_summary,
+                        ai_hashtags=ai_hashtags
+                    )
+                    return msg_html, rh
+            except Exception:
+                pass
+
+    # Fallback translate/compose
     headline, summ, details, ai_hashtags = openai_translate_compose(client, title, rss_summary, article_type)
 
-    if len(headline + summ + details) < 400:
+    # One rewrite retry here too (rare but possible)
+    joined = f"{headline}\n{summ}\n{details}"
+    if has_unwanted_latin(joined):
+        try:
+            headline, summ, details = openai_rewrite_russian_only(client, headline, summ, details)
+        except Exception:
+            pass
+
+    joined2 = f"{headline}\n{summ}\n{details}"
+    if not is_russian_enough(joined2) or has_unwanted_latin(joined2):
+        raise ValueError("OpenAI response was not consistent Russian or contained too much Latin.")
+
+    if len(headline + summ + details) < 260:
         raise ValueError(f"Generated content too short ({len(headline + summ + details)} chars).")
 
     msg_html = build_message_html(
-        headline, summ, details, source, link,
-        rss_title=title, rss_summary=rss_summary, ai_hashtags=ai_hashtags
+        headline=headline,
+        summary=summ,
+        details=details,
+        source=source,
+        link=link,
+        rss_title=title,
+        rss_summary=rss_summary,
+        ai_hashtags=ai_hashtags
     )
     return msg_html, headline
 
 
 # ============================================================
-# BRIEF MODE (Paywalled/thin RSS) + TRANSLATION (Russian-only)
+# BRIEF MODE (PAYWALL / LAST RESORT) + TRANSLATION
 # ============================================================
 
 def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple[str, str]:
-    """
-    Translate title + teaser to Russian ONLY, without adding facts.
-    Returns (ru_title, ru_teaser). Raises if output not Russian enough.
-    """
     t = (title or "").strip()
     s = (teaser or "").strip()
 
     prompt = f"""
 Переведи на русский язык ТОЛЬКО то, что дано. Не добавляй факты, имена, цифры или детали, которых нет в исходном тексте.
-Не используй латиницу. Только кириллица.
+Не используй латиницу (кроме разрешённых сокращений: {", ".join(sorted(LATIN_ALLOWLIST))}).
 
 Верни РОВНО в 2 строки:
 ЗАГОЛОВОК: <перевод заголовка>
@@ -1045,7 +1055,7 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
     r = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Russian Cyrillic only. No Latin. No extra facts."},
+            {"role": "system", "content": "Russian Cyrillic only. No new facts."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.0,
@@ -1064,23 +1074,15 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
         ru_teaser = ""
 
     joined = f"{ru_title}\n{ru_teaser}".strip()
-    if not joined:
-        raise ValueError("brief translation empty")
-    if not is_russian_enough(joined) or has_latin_words(joined):
+    if not joined or not is_russian_enough(joined) or has_unwanted_latin(joined):
         raise ValueError("brief translation not Russian-only")
 
     return ru_title, ru_teaser
 
 
 def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str) -> tuple[str, str]:
-    """
-    Paywalled/thin: post short, verified-only content.
-    Title + teaser are translated to Russian, no invented details.
-    Returns (msg_html, headline_used).
-    """
     teaser_src = strip_html_text(rss_summary_raw or "").strip()
 
-    # Translate (Russian-only)
     ru_title, ru_teaser = translate_brief_to_russian(client, title, teaser_src)
 
     headline = "📰 " + (ru_title or "").strip()
@@ -1108,11 +1110,6 @@ def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_sum
 
 
 def is_paywalled_like(source: str, link: str) -> bool:
-    """
-    Paywall detection:
-      - Aftonbladet, Expressen by source name
-      - DN by domain (dn.se) ALWAYS paywalled per your requirement
-    """
     src = (source or "").lower()
     host = ""
     try:
@@ -1123,7 +1120,7 @@ def is_paywalled_like(source: str, link: str) -> bool:
     if "aftonbladet" in src or "expressen" in src:
         return True
 
-    # DN: always paid (dn.se + any subdomain)
+    # DN: ALWAYS paywalled per your requirement
     if host.endswith("dn.se"):
         return True
 
@@ -1175,14 +1172,12 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             if s < MIN_SCORE:
                 continue
 
-            # Deduplication: check against recent database titles
             if any(is_similar(title, rt) for rt in recent_titles):
                 print(f"[RSS] skipping similar (to DB): {title} ({source})", flush=True)
                 continue
 
             candidates.append((s, source, title, summ, link, item_id))
 
-    # Internal candidates deduplication (same run, different sources)
     candidates.sort(key=lambda x: x[0], reverse=True)
     unique_candidates = []
     seen_titles_this_run = []
@@ -1205,7 +1200,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
     for s, source, title, summ, link, item_id in candidates[:max(1, MAX_PER_RUN)]:
         article_type = detect_article_type(source, title, link)
 
-        # Extract image URL (best-effort)
+        # Image
         image_url = ""
         try:
             image_url = fetch_article_image(link)
@@ -1214,29 +1209,31 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             save_failure(conn, source, item_id, "fetch_image", str(ie))
             image_url = ""
 
-        # Filter image: if not usable -> store empty
         if image_url and not is_usable_image(image_url):
             image_url = ""
 
-        # Decide BRIEF mode:
+        # Paywall logic
         summ_clean = strip_html_text(summ or "")
-        is_thin = len(summ_clean) < 180  # threshold for “thin RSS”
-
-        # Paywall detection (includes DN by domain)
+        is_thin = len(summ_clean) < 180
         paywalled = is_paywalled_like(source, link)
 
-        # DN: ALWAYS brief; others: brief only when thin
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
+
+        # DN always brief; others only if thin+paywalled
         use_brief = is_dn or (paywalled and is_thin)
 
         try:
             if use_brief:
                 msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
             else:
+                # bulletproof AI post
                 msg_html, generated_headline = generate_post(client, source, title, summ, link, article_type)
+
         except Exception as ex:
             msg = str(ex)
+
+            # Rate limit handling
             if "rate limit" in msg.lower() or "429" in msg:
                 wait = parse_rate_limit_wait_seconds(msg)
                 app.bot_data["next_ai_time"] = time.time() + wait
@@ -1251,19 +1248,23 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                     pass
                 return
 
-            dropped += 1
-            print(f"[DROP] generate_post {source}: {ex}", flush=True)
-            save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
-            continue
+            # FINAL fallback: brief mode (prevents DROP)
+            try:
+                msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
+                print(f"[FALLBACK] brief mode used for {source} due to: {ex}", flush=True)
+            except Exception as ex2:
+                dropped += 1
+                print(f"[DROP] {source}: {ex} / fallback_failed: {ex2}", flush=True)
+                save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
+                continue
 
-        # Post-generation deduplication: check Russian headline similarity
+        # Dedup based on generated headline
         if any(is_similar(generated_headline, rh) for rh in recent_headlines):
             print(f"[RSS] skipping similar generated headline: {generated_headline} ({source})", flush=True)
             dropped += 1
             continue
 
         if AUTO_POST:
-            # Auto-post immediately
             draft_id = save_draft(conn, msg_html, status="posted", image_url=image_url)
             try:
                 await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url)
@@ -1278,10 +1279,8 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 conn.commit()
                 continue
         else:
-            # Manual approval flow
             draft_id = save_draft(conn, msg_html, status="pending", image_url=image_url)
             editor_payload = f"📝 Draft #{draft_id}\n\n{msg_html}\n\n/post {draft_id} | /skip {draft_id}"
-
             try:
                 await send_html_safe(bot, EDITOR_CHAT_ID, editor_payload)
             except Exception as te:
@@ -1354,6 +1353,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- failures table: {failures}\n"
         f"- previews_disabled: {DISABLE_PREVIEWS}\n"
         f"- AUTO_POST: {AUTO_POST}\n"
+        f"- allowlist: {', '.join(sorted(LATIN_ALLOWLIST))}\n"
     )
 
 
@@ -1398,7 +1398,6 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_url = (image_url or "").strip()
-
         await publish_to_channel(context.bot, PUBLIC_CHANNEL_ID, text, image_url)
 
         c.execute("UPDATE drafts SET status='posted' WHERE id=?", (did,))
@@ -1442,7 +1441,7 @@ async def post_init(app: Application) -> None:
 
     await app.bot.send_message(
         chat_id=EDITOR_CHAT_ID,
-        text="✅ Bot started. Russian-only fallback enabled. Previews off. Links hidden. Hashtags enabled.",
+        text="✅ Bot started. Bulletproof Russian-only mode enabled (allowlist + rewrite + brief fallback).",
         disable_web_page_preview=True
     )
 

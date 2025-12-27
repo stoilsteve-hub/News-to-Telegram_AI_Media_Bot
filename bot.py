@@ -17,6 +17,7 @@ from openai import OpenAI
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 # ============================================================
 # ENV
@@ -454,7 +455,7 @@ TOPIC_TRIGGERS = {
     "crime": ["убийств", "взрыв", "стрельб", "насил", "суд", "полици", "brott", "polis", "skjut", "explosion", "våldtäkt", "domstol"],
     "migration": ["миграц", "беженц", "убежищ", "депортац", "migration", "asyl", "utvis", "flykting"],
     "economy": ["эконом", "инфляц", "цены", "налог", "бюджет", "ekonomi", "inflation", "pris", "skatt", "budget"],
-    "rates": ["риксbank", "ставк", "ипотек", "кредит", "процент", "riksbank", "ränta", "lån", "bolån"],
+    "rates": ["риксбанк", "ставк", "ипотек", "кредит", "процент", "riksbank", "ränta", "lån", "bolån"],
     "energy": ["газ", "нефть", "электр", "энерг", "gas", "olja", "elpris", "energi"],
     "eu": ["ес", "евросоюз", "eu", "europarlament"],
     "foreign": ["диплом", "переговор", "посол", "геополит", "utrikes", "diplomati"],
@@ -1146,7 +1147,7 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
     if ru_teaser.lower() in {"нет", "нет.", "—", "-", "n/a"}:
         ru_teaser = ""
 
-    # Deterministic scrub BEFORE validation (this is what fixes your current drops)
+    # Deterministic scrub BEFORE validation (fixes Latin leaks)
     ru_title = scrub_to_russian_only(ru_title)
     ru_teaser = scrub_to_russian_only(ru_teaser)
 
@@ -1187,20 +1188,69 @@ def build_brief_message_html_ru(client: OpenAI, source: str, title: str, rss_sum
     return msg_html, headline
 
 
-def is_paywalled_like(source: str, link: str) -> bool:
-    src = (source or "").lower()
+# ============================================================
+# PAYWALL DETECTION (fixes AB/Expressen misclassification)
+# ============================================================
+
+IS_FREE_RE = re.compile(r'"isAccessibleForFree"\s*:\s*(true|false)', re.I)
+
+
+def detect_is_accessible_for_free(article_url: str) -> bool | None:
+    """
+    Returns:
+      True  -> explicitly free
+      False -> explicitly paywalled
+      None  -> unknown (no signal / fetch failed)
+    """
+    u = (article_url or "").strip()
+    if not u:
+        return None
+    try:
+        resp = requests.get(
+            u,
+            timeout=20,
+            headers={
+                "User-Agent": feedparser.USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        txt = resp.text or ""
+        m = IS_FREE_RE.search(txt)
+        if not m:
+            return None
+        return m.group(1).lower() == "true"
+    except Exception:
+        return None
+
+
+def is_paywalled_like(source: str, link: str, rss_summary_raw: str = "") -> bool:
+    """
+    DN: always paywalled (per requirement).
+    Aftonbladet/Expressen: check schema.org isAccessibleForFree if possible.
+    Fallback: thin RSS snippet => likely paywalled.
+    """
     host = ""
     try:
         host = (urlparse(link or "").netloc or "").lower()
     except Exception:
         host = ""
 
-    if "aftonbladet" in src or "expressen" in src:
-        return True
-
-    # DN: ALWAYS paywalled per your requirement
+    # DN always paywalled
     if host.endswith("dn.se"):
         return True
+
+    summ_clean = strip_html_text(rss_summary_raw or "")
+    is_thin = len(summ_clean) < 180
+
+    if host.endswith("aftonbladet.se") or host.endswith("expressen.se"):
+        free_flag = detect_is_accessible_for_free(link)
+        if free_flag is True:
+            return False
+        if free_flag is False:
+            return True
+        return is_thin
 
     return False
 
@@ -1290,15 +1340,15 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         if image_url and not is_usable_image(image_url):
             image_url = ""
 
-        # Paywall logic
+        # Paywall logic (fixed)
         summ_clean = strip_html_text(summ or "")
         is_thin = len(summ_clean) < 180
-        paywalled = is_paywalled_like(source, link)
+        paywalled = is_paywalled_like(source, link, summ)
 
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
 
-        # DN always brief; others brief if thin+paywalled
+        # DN always brief; others brief if paywalled AND thin
         use_brief = is_dn or (paywalled and is_thin)
 
         try:
@@ -1323,7 +1373,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                     pass
                 return
 
-            # FINAL fallback: brief mode (prevents drop)
+            # FINAL fallback: brief mode
             try:
                 msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
                 print(f"[FALLBACK] brief mode used for {source} due to: {ex}", flush=True)
@@ -1513,11 +1563,14 @@ async def post_init(app: Application) -> None:
     app.bot_data["next_ai_time"] = 0.0
     app.bot_data["last_run_time"] = 0.0
 
-    await app.bot.send_message(
-        chat_id=EDITOR_CHAT_ID,
-        text="✅ Bot started. Deterministic Russian-only scrub enabled (no Latin drops).",
-        disable_web_page_preview=True
-    )
+    try:
+        await app.bot.send_message(
+            chat_id=EDITOR_CHAT_ID,
+            text="✅ Bot started. Russian-only scrub enabled. Paywall detection uses isAccessibleForFree for AB/Expressen; DN forced brief.",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        print(f"[WARN] startup notify failed: {e}", flush=True)
 
     app.job_queue.run_repeating(
         rss_job_callback,
@@ -1532,7 +1585,14 @@ def main():
     print(f"[BOOT] env ok. job_tick={JOB_TICK_SECONDS}s db={DB_PATH}", flush=True)
     print("[BOOT] polling telegram…", flush=True)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+
+    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("status", cmd_status))

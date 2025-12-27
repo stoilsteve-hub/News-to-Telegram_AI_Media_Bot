@@ -225,6 +225,7 @@ def fetch_article_image(article_url: str) -> str:
 
     return ""
 
+
 # ============================================================
 # IMAGE FILTERING (Mode A: if not usable -> no image)
 # ============================================================
@@ -313,8 +314,8 @@ def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int]:
                 break
             if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
                 if i + 7 <= n:
-                    h = int.from_bytes(data[i + 3:i +  5], "big", signed=False)
-                    w = int.from_bytes(data[i + 5:i +  7], "big", signed=False)
+                    h = int.from_bytes(data[i + 3:i + 5], "big", signed=False)
+                    w = int.from_bytes(data[i + 5:i + 7], "big", signed=False)
                     return (w, h)
                 break
             i += seglen
@@ -453,7 +454,7 @@ TOPIC_TRIGGERS = {
     "crime": ["убийств", "взрыв", "стрельб", "насил", "суд", "полици", "brott", "polis", "skjut", "explosion", "våldtäkt", "domstol"],
     "migration": ["миграц", "беженц", "убежищ", "депортац", "migration", "asyl", "utvis", "flykting"],
     "economy": ["эконом", "инфляц", "цены", "налог", "бюджет", "ekonomi", "inflation", "pris", "skatt", "budget"],
-    "rates": ["риксбанк", "ставк", "ипотек", "кредит", "процент", "riksbank", "ränta", "lån", "bolån"],
+    "rates": ["риксbank", "ставк", "ипотек", "кредит", "процент", "riksbank", "ränta", "lån", "bolån"],
     "energy": ["газ", "нефть", "электр", "энерг", "gas", "olja", "elpris", "energi"],
     "eu": ["ес", "евросоюз", "eu", "europarlament"],
     "foreign": ["диплом", "переговор", "посол", "геополит", "utrikes", "diplomati"],
@@ -608,6 +609,7 @@ def save_draft(conn: sqlite3.Connection, msg_html: str, status: str = "pending",
     conn.commit()
     return int(cur.lastrowid)
 
+
 # ============================================================
 # TELEGRAM HELPERS
 # ============================================================
@@ -704,17 +706,47 @@ def build_message_html(headline: str, summary: str, details: str, source: str, l
 
 
 # ============================================================
-# OPENAI + BULLETPROOF RUSSIAN-ONLY VALIDATION
+# OPENAI + BULLETPROOF RUSSIAN-ONLY
 # ============================================================
 
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
-# Allowlist of Latin tokens that are acceptable (avoid false drops).
-# Keep this SHORT. Add only what you really want to allow.
+# Allowlist of Latin tokens that are acceptable (kept tiny; everything else gets scrubbed)
 LATIN_ALLOWLIST = {
     "EU", "NATO", "USA", "UN", "WHO", "IMF", "ECB", "SVT", "SR", "DN", "TV4",
     "G7", "G20", "COVID", "COVID-19", "SEK", "OECD", "OSCE"
 }
+
+# Prefer Cyrillic replacements for common acronyms (prettier than transliteration)
+ACRONYM_CYR_MAP = {
+    "EU": "ЕС",
+    "NATO": "НАТО",
+    "USA": "США",
+    "UN": "ООН",
+    "WHO": "ВОЗ",
+    "SVT": "СВТ",
+    "SR": "СР",
+    "DN": "ДН",
+    "TV4": "ТВ4",
+    "G7": "Г7",
+    "G20": "Г20",
+    "COVID": "КОВИД",
+    "COVID-19": "КОВИД-19",
+    "SEK": "СЕК",
+    "OECD": "ОЭСР",
+    "OSCE": "ОБСЕ",
+}
+
+# Minimal deterministic transliteration to eliminate Latin (not perfect Russian spelling, but no A-Za-z remains)
+_LAT2CYR = str.maketrans({
+    "A": "А", "B": "Б", "C": "К", "D": "Д", "E": "Е", "F": "Ф", "G": "Г", "H": "Х", "I": "И", "J": "Й",
+    "K": "К", "L": "Л", "M": "М", "N": "Н", "O": "О", "P": "П", "Q": "К", "R": "Р", "S": "С", "T": "Т",
+    "U": "У", "V": "В", "W": "В", "X": "Кс", "Y": "Й", "Z": "З",
+    "a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф", "g": "г", "h": "х", "i": "и", "j": "й",
+    "k": "к", "l": "л", "m": "м", "n": "н", "o": "о", "p": "п", "q": "к", "r": "р", "s": "с", "t": "т",
+    "u": "у", "v": "в", "w": "в", "x": "кс", "y": "й", "z": "з",
+    "å": "о", "Å": "О", "ä": "е", "Ä": "Е", "ö": "е", "Ö": "Е",
+})
 
 
 def is_russian_enough(text: str) -> bool:
@@ -726,9 +758,7 @@ def is_russian_enough(text: str) -> bool:
 
 
 def find_latin_words(text: str) -> list[str]:
-    # Capture basic A-Za-z words (including hyphen)
-    words = re.findall(r"\b[A-Za-z][A-Za-z\-]{1,}\b", text or "")
-    return words
+    return re.findall(r"\b[A-Za-z][A-Za-z\-]{1,}\b", text or "")
 
 
 def has_unwanted_latin(text: str) -> bool:
@@ -740,6 +770,40 @@ def has_unwanted_latin(text: str) -> bool:
             continue
         return True
     return False
+
+
+def unwanted_latin_words(text: str) -> list[str]:
+    words = find_latin_words(text)
+    bad = []
+    for w in words:
+        if w.upper() in LATIN_ALLOWLIST:
+            continue
+        bad.append(w)
+    return bad
+
+
+def scrub_to_russian_only(text: str) -> str:
+    """
+    Deterministically remove Latin:
+    1) replace known acronyms with Cyrillic equivalents
+    2) transliterate remaining Latin letters (incl. åäö) to Cyrillic lookalikes
+    """
+    if not text:
+        return text
+
+    # Replace acronyms first (word boundaries, case-insensitive)
+    if ACRONYM_CYR_MAP:
+        pattern = r"\b(" + "|".join(re.escape(k) for k in sorted(ACRONYM_CYR_MAP.keys(), key=len, reverse=True)) + r")\b"
+
+        def repl(m: re.Match) -> str:
+            token = m.group(0)
+            return ACRONYM_CYR_MAP.get(token.upper(), token)
+
+        text = re.sub(pattern, repl, text, flags=re.I)
+
+    # Transliterate any remaining latin letters
+    text = text.translate(_LAT2CYR)
+    return text
 
 
 def extract_block(raw: str, label: str) -> str:
@@ -876,20 +940,25 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
     if not headline or not summary or not details:
         raise ValueError("OpenAI response missing HEADLINE, SUMMARY, or DETAILS.")
 
+    # Deterministic scrub before validation
+    headline = scrub_to_russian_only(headline)
+    summary = scrub_to_russian_only(summary)
+    details = scrub_to_russian_only(details)
+
     joined = f"{headline}\n{summary}\n{details}"
     if not is_russian_enough(joined) or has_unwanted_latin(joined):
-        raise ValueError("OpenAI response was not consistent Russian or contained too much Latin.")
+        bad = unwanted_latin_words(joined)
+        raise ValueError(f"OpenAI response was not consistent Russian or contained too much Latin (bad={bad[:12]}).")
 
     return headline, summary, details, hashtags
 
 
 def openai_rewrite_russian_only(client: OpenAI, headline: str, summary: str, details: str) -> tuple[str, str, str]:
     """
-    Second-chance rewrite: keep meaning, remove Latin (except allowlist), do NOT add facts.
+    Second-chance rewrite: keep meaning, remove Latin, do NOT add facts.
     """
     prompt = f"""
 Перепиши этот текст так, чтобы он был ТОЛЬКО на русском языке (кириллица).
-Разрешены только эти латинские сокращения: {", ".join(sorted(LATIN_ALLOWLIST))}
 
 СТРОГО:
 - Не добавляй факты, цифры, имена, детали, которых нет в тексте.
@@ -912,11 +981,11 @@ def openai_rewrite_russian_only(client: OpenAI, headline: str, summary: str, det
     r = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Russian Cyrillic only except allowlisted acronyms. No new facts."},
+            {"role": "system", "content": "Russian Cyrillic only. No Latin. No new facts."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.0,
-        max_tokens=650,
+        max_tokens=700,
     )
     raw = (r.choices[0].message.content or "").strip()
 
@@ -930,11 +999,17 @@ def openai_rewrite_russian_only(client: OpenAI, headline: str, summary: str, det
 
     nd = re.sub(r"^\s*[-•]\s*", "• ", nd, flags=re.M).strip()
 
+    # Deterministic scrub
+    nh = scrub_to_russian_only(nh)
+    ns = scrub_to_russian_only(ns)
+    nd = scrub_to_russian_only(nd)
+
     joined = f"{nh}\n{ns}\n{nd}"
     if not nh or not ns or not nd:
         raise ValueError("rewrite missing sections")
     if not is_russian_enough(joined) or has_unwanted_latin(joined):
-        raise ValueError("rewrite still has too much Latin")
+        bad = unwanted_latin_words(joined)
+        raise ValueError(f"rewrite still has Latin (bad={bad[:12]})")
 
     return nh, ns, nd
 
@@ -950,7 +1025,6 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
         re.search(r"\bDETAILS:\s*\n", raw)
     )
 
-    # Try labeled format first
     if has_labels:
         headline = extract_block(raw, "HEADLINE")
         summ = extract_block(raw, "SUMMARY")
@@ -964,54 +1038,53 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
                 if clean_t:
                     ai_hashtags.append(clean_t)
 
-        joined = f"{headline}\n{summ}\n{details}"
-        if headline and summ and details and is_russian_enough(joined) and not has_unwanted_latin(joined):
-            if len(headline + summ + details) >= 400:
+        # Scrub + validate
+        headline_s = scrub_to_russian_only(headline)
+        summ_s = scrub_to_russian_only(summ)
+        details_s = scrub_to_russian_only(details)
+
+        joined = f"{headline_s}\n{summ_s}\n{details_s}"
+        if headline_s and summ_s and details_s and is_russian_enough(joined) and not has_unwanted_latin(joined):
+            if len(headline_s + summ_s + details_s) >= 260:
                 msg_html = build_message_html(
-                    headline=headline,
-                    summary=summ,
-                    details=details,
+                    headline=headline_s,
+                    summary=summ_s,
+                    details=details_s,
                     source=source,
                     link=link,
                     rss_title=title,
                     rss_summary=rss_summary,
                     ai_hashtags=ai_hashtags
                 )
-                return msg_html, headline
+                return msg_html, headline_s
 
-        # One rewrite retry if Latin leaks
+        # One rewrite retry if anything looks off
         if headline and summ and details:
-            try:
-                rh, rs, rd = openai_rewrite_russian_only(client, headline, summ, details)
-                if len(rh + rs + rd) >= 260:  # allow shorter after rewrite
-                    msg_html = build_message_html(
-                        headline=rh,
-                        summary=rs,
-                        details=rd,
-                        source=source,
-                        link=link,
-                        rss_title=title,
-                        rss_summary=rss_summary,
-                        ai_hashtags=ai_hashtags
-                    )
-                    return msg_html, rh
-            except Exception:
-                pass
+            rh, rs, rd = openai_rewrite_russian_only(client, headline, summ, details)
+            msg_html = build_message_html(
+                headline=rh,
+                summary=rs,
+                details=rd,
+                source=source,
+                link=link,
+                rss_title=title,
+                rss_summary=rss_summary,
+                ai_hashtags=ai_hashtags
+            )
+            return msg_html, rh
 
-    # Fallback translate/compose
+    # Fallback: translate/compose
     headline, summ, details, ai_hashtags = openai_translate_compose(client, title, rss_summary, article_type)
 
-    # One rewrite retry here too (rare but possible)
-    joined = f"{headline}\n{summ}\n{details}"
-    if has_unwanted_latin(joined):
-        try:
-            headline, summ, details = openai_rewrite_russian_only(client, headline, summ, details)
-        except Exception:
-            pass
+    # Final scrub (already scrubbed in openai_translate_compose, but safe)
+    headline = scrub_to_russian_only(headline)
+    summ = scrub_to_russian_only(summ)
+    details = scrub_to_russian_only(details)
 
     joined2 = f"{headline}\n{summ}\n{details}"
     if not is_russian_enough(joined2) or has_unwanted_latin(joined2):
-        raise ValueError("OpenAI response was not consistent Russian or contained too much Latin.")
+        bad = unwanted_latin_words(joined2)
+        raise ValueError(f"OpenAI response was not consistent Russian or contained too much Latin (bad={bad[:12]}).")
 
     if len(headline + summ + details) < 260:
         raise ValueError(f"Generated content too short ({len(headline + summ + details)} chars).")
@@ -1030,7 +1103,7 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
 
 
 # ============================================================
-# BRIEF MODE (PAYWALL / LAST RESORT) + TRANSLATION
+# BRIEF MODE (PAYWALL / LAST RESORT)
 # ============================================================
 
 def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple[str, str]:
@@ -1039,7 +1112,7 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
 
     prompt = f"""
 Переведи на русский язык ТОЛЬКО то, что дано. Не добавляй факты, имена, цифры или детали, которых нет в исходном тексте.
-Не используй латиницу (кроме разрешённых сокращений: {", ".join(sorted(LATIN_ALLOWLIST))}).
+Пиши кириллицей.
 
 Верни РОВНО в 2 строки:
 ЗАГОЛОВОК: <перевод заголовка>
@@ -1059,7 +1132,7 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
             {"role": "user", "content": prompt},
         ],
         temperature=0.0,
-        max_tokens=220,
+        max_tokens=260,
     )
 
     raw = (r.choices[0].message.content or "").strip()
@@ -1073,9 +1146,14 @@ def translate_brief_to_russian(client: OpenAI, title: str, teaser: str) -> tuple
     if ru_teaser.lower() in {"нет", "нет.", "—", "-", "n/a"}:
         ru_teaser = ""
 
+    # Deterministic scrub BEFORE validation (this is what fixes your current drops)
+    ru_title = scrub_to_russian_only(ru_title)
+    ru_teaser = scrub_to_russian_only(ru_teaser)
+
     joined = f"{ru_title}\n{ru_teaser}".strip()
     if not joined or not is_russian_enough(joined) or has_unwanted_latin(joined):
-        raise ValueError("brief translation not Russian-only")
+        bad = unwanted_latin_words(joined)
+        raise ValueError(f"brief translation not Russian-only (bad={bad[:12]})")
 
     return ru_title, ru_teaser
 
@@ -1200,7 +1278,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
     for s, source, title, summ, link, item_id in candidates[:max(1, MAX_PER_RUN)]:
         article_type = detect_article_type(source, title, link)
 
-        # Image
+        # Image extraction
         image_url = ""
         try:
             image_url = fetch_article_image(link)
@@ -1220,20 +1298,17 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
 
-        # DN always brief; others only if thin+paywalled
+        # DN always brief; others brief if thin+paywalled
         use_brief = is_dn or (paywalled and is_thin)
 
         try:
             if use_brief:
                 msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
             else:
-                # bulletproof AI post
                 msg_html, generated_headline = generate_post(client, source, title, summ, link, article_type)
-
         except Exception as ex:
             msg = str(ex)
 
-            # Rate limit handling
             if "rate limit" in msg.lower() or "429" in msg:
                 wait = parse_rate_limit_wait_seconds(msg)
                 app.bot_data["next_ai_time"] = time.time() + wait
@@ -1248,7 +1323,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                     pass
                 return
 
-            # FINAL fallback: brief mode (prevents DROP)
+            # FINAL fallback: brief mode (prevents drop)
             try:
                 msg_html, generated_headline = build_brief_message_html_ru(client, source, title, summ, link)
                 print(f"[FALLBACK] brief mode used for {source} due to: {ex}", flush=True)
@@ -1258,7 +1333,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
                 continue
 
-        # Dedup based on generated headline
+        # Headline dedup
         if any(is_similar(generated_headline, rh) for rh in recent_headlines):
             print(f"[RSS] skipping similar generated headline: {generated_headline} ({source})", flush=True)
             dropped += 1
@@ -1353,7 +1428,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- failures table: {failures}\n"
         f"- previews_disabled: {DISABLE_PREVIEWS}\n"
         f"- AUTO_POST: {AUTO_POST}\n"
-        f"- allowlist: {', '.join(sorted(LATIN_ALLOWLIST))}\n"
     )
 
 
@@ -1441,7 +1515,7 @@ async def post_init(app: Application) -> None:
 
     await app.bot.send_message(
         chat_id=EDITOR_CHAT_ID,
-        text="✅ Bot started. Bulletproof Russian-only mode enabled (allowlist + rewrite + brief fallback).",
+        text="✅ Bot started. Deterministic Russian-only scrub enabled (no Latin drops).",
         disable_web_page_preview=True
     )
 

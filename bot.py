@@ -1396,7 +1396,7 @@ async def detect_is_accessible_for_free(client: httpx.AsyncClient, article_url: 
 
 async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, rss_summary_raw: str = "") -> bool:
     """
-    DN: always paywalled (per requirement).
+    DN: check schema.org isAccessibleForFree if possible.
     Aftonbladet/Expressen: check schema.org isAccessibleForFree if possible.
     Fallback: thin RSS snippet => likely paywalled.
     """
@@ -1406,12 +1406,11 @@ async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, r
     except Exception:
         host = ""
 
-    # host ends with DN, etc., handled by general check below
-
     summ_clean = strip_html_text(rss_summary_raw or "")
     is_thin = len(summ_clean) < 180
 
-    if host.endswith("aftonbladet.se") or host.endswith("expressen.se"):
+    # These sources support the "isAccessibleForFree" JSON-LD check
+    if any(host.endswith(d) for d in ["aftonbladet.se", "expressen.se", "dn.se"]):
         free_flag = await detect_is_accessible_for_free(client, link)
         if free_flag is True:
             return False
@@ -1419,7 +1418,8 @@ async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, r
             return True
         return is_thin
 
-    return False
+    # For other sources, rely on snippet length
+    return is_thin
 
 
 # ============================================================

@@ -601,7 +601,8 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS posted (
             item_id TEXT PRIMARY KEY,
             posted_at TEXT NOT NULL,
-            title TEXT
+            title TEXT,
+            headline TEXT
         )
     """)
     c.execute("""
@@ -619,6 +620,7 @@ def init_db() -> sqlite3.Connection:
     # Store parsed image URL (non-breaking migration)
     _ensure_column(conn, "drafts", "image_url", "TEXT")
     _ensure_column(conn, "posted", "title", "TEXT")
+    _ensure_column(conn, "posted", "headline", "TEXT")
 
     return conn
 
@@ -640,18 +642,35 @@ def is_similar(text1: str, text2: str, threshold: float = 0.7) -> bool:
     """Check if two strings are similar using SequenceMatcher."""
     if not text1 or not text2:
         return False
-    # Normalize for comparison
-    t1 = text1.lower().strip()
-    t2 = text2.lower().strip()
+
+    # Comprehensive normalization
+    def clean(s):
+        s = s.lower().strip()
+        # Remove common news source prefixes
+        s = re.sub(r"^(expressen|aftonbladet|svt|sr|dn|svd|8 sidor|swedes in russia|sverige|nyheter|radio|ekot)[:\-\s]+", "", s, flags=re.I)
+        # Remove emojis and special chars
+        s = re.sub(r"[^\w\s]", "", s)
+        return s.strip()
+
+    t1, t2 = clean(text1), clean(text2)
+    if not t1 or not t2:
+        return False
     if t1 == t2:
         return True
     ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
     return ratio >= threshold
 
 
-def mark_posted(conn: sqlite3.Connection, item_id: str, title: str = "") -> None:
-    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at, title) VALUES (?, ?, ?)",
-                 (item_id, utc_now_iso(), title))
+def get_recent_headlines(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
+    c = conn.cursor()
+    c.execute("SELECT headline FROM posted WHERE headline IS NOT NULL AND headline != '' ORDER BY posted_at DESC LIMIT ?",
+              (limit,))
+    return [row[0] for row in c.fetchall()]
+
+
+def mark_posted(conn: sqlite3.Connection, item_id: str, title: str = "", headline: str = "") -> None:
+    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at, title, headline) VALUES (?, ?, ?, ?)",
+                 (item_id, utc_now_iso(), title, headline))
     conn.commit()
 
 
@@ -850,15 +869,23 @@ def openai_strict_three_blocks(client: OpenAI, source: str, title: str, rss_summ
         )
 
     prompt = f"""
-Ты пишешь для русскоязычного Telegram-канала о Швеции.
+Ты пишешь для русскоязычного Telegram-канала о Швеции. Твоя задача — сделать максимально точный, интересный и фактически верный пост.
+
+ПРАВИЛА ТРАНСЛИТЕРАЦИИ:
+- Имена шведских штормов и событий переводи единообразно (например, Johannes -> Йоханнес, а не Иоанн).
+- Будь предельно точен с результатами спортивных матчей. Если в тексте "Sweden was trailing but won", заголовок должен быть "Швеция победила", а не "Швеция проиграла".
 
 СТРОГО:
-- Пиши ТОЛЬКО по-русски (кириллица). Не используй английские/шведские слова.
-- Не выдумывай факты. Используй только то, что есть в заголовке/описании RSS.
-- Не цитируй дословно.
-- Никакого Markdown/HTML. Обычный текст.
-- Верни РОВНО 4 блока с точными метками: HEADLINE / SUMMARY / DETAILS / HASHTAGS.
-- Никаких других строк до/после блоков.
+- Пиши ТОЛЬКО по-русски.
+- Не выдумывай факты.
+- Никакого Markdown/HTML.
+- Верни РОВНО 5 блоков с метками: THINKING / HEADLINE / SUMMARY / DETAILS / HASHTAGS.
+
+THINKING:
+Проанализируй источник на русском языке:
+1. Кто/Что: основной субъект (например, сборная Швеции, шторм Йоханнес).
+2. Где: точное место действия (например, Киев). Если действие в Киеве, НЕ пиши "в России".
+3. Итог: какой финальный результат или действие (например, победа, массированная атака). Убедись, что заголовок не противоречит итогу.
 
 HEADLINE:
 ...
@@ -885,7 +912,7 @@ HASHTAGS:
         model=OPENAI_MODEL,
         messages=[
             {"role": "system",
-             "content": "Return Russian only. Exactly 4 blocks: HEADLINE, SUMMARY, DETAILS, HASHTAGS."},
+             "content": "Return Russian only. Exactly 5 blocks: THINKING, HEADLINE, SUMMARY, DETAILS, HASHTAGS. Be extremely careful with facts and names."},
             {"role": "user", "content": prompt},
         ],
         temperature=OPENAI_TEMPERATURE,
@@ -980,7 +1007,7 @@ def openai_translate_compose(client: OpenAI, title: str, rss_summary: str, artic
     return headline, summary, details, hashtags
 
 
-def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> str:
+def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str, link: str, article_type: str) -> tuple[str, str]:
     rss_summary = strip_html_text(rss_summary_raw)
 
     raw = openai_strict_three_blocks(client, source, title, rss_summary, link, article_type)
@@ -1009,8 +1036,9 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
             if len(headline + summ + details) < 400:
                 pass
             else:
-                return build_message_html(headline, summ, details, source, link, rss_title=title,
-                                          rss_summary=rss_summary, ai_hashtags=ai_hashtags)
+                msg_html = build_message_html(headline, summ, details, source, link, rss_title=title,
+                                              rss_summary=rss_summary, ai_hashtags=ai_hashtags)
+                return msg_html, headline
 
     headline, summ, details, ai_hashtags = openai_translate_compose(client, title, rss_summary, article_type)
 
@@ -1018,8 +1046,9 @@ def generate_post(client: OpenAI, source: str, title: str, rss_summary_raw: str,
     if len(headline + summ + details) < 400:
         raise ValueError(f"Generated content too short ({len(headline + summ + details)} chars).")
 
-    return build_message_html(headline, summ, details, source, link, rss_title=title, rss_summary=rss_summary,
-                              ai_hashtags=ai_hashtags)
+    msg_html = build_message_html(headline, summ, details, source, link, rss_title=title, rss_summary=rss_summary,
+                                  ai_hashtags=ai_hashtags)
+    return msg_html, headline
 
 
 # ============================================================
@@ -1042,6 +1071,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         return
 
     recent_titles = get_recent_titles(conn)
+    recent_headlines = get_recent_headlines(conn)
     candidates = []
     for source, url in RSS_FEEDS:
         try:
@@ -1109,7 +1139,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             image_url = ""
 
         try:
-            msg_html = generate_post(client, source, title, summ, link, article_type)
+            msg_html, generated_headline = generate_post(client, source, title, summ, link, article_type)
         except Exception as ex:
             msg = str(ex)
             if "rate limit" in msg.lower() or "429" in msg:
@@ -1129,6 +1159,12 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             dropped += 1
             print(f"[DROP] generate_post {source}: {ex}", flush=True)
             save_failure(conn, source, item_id, "generate_post", f"{ex}\n{traceback.format_exc()}")
+            continue
+
+        # Post-generation deduplication: check Russian headline similarity
+        if any(is_similar(generated_headline, rh) for rh in recent_headlines):
+            print(f"[RSS] skipping similar generated headline: {generated_headline} ({source})", flush=True)
+            dropped += 1
             continue
 
         if AUTO_POST:
@@ -1164,7 +1200,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 conn.commit()
                 continue
 
-        mark_posted(conn, item_id, title=title)
+        mark_posted(conn, item_id, title=title, headline=generated_headline)
         produced += 1
         await asyncio.sleep(1.0)
 

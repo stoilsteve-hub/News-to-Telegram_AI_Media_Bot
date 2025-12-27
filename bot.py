@@ -1522,18 +1522,20 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         is_thin = len(summ_clean) < 180
         paywalled = await is_paywalled_like(http_client, source, link, summ)
 
-        # Context enrichment: Fetch full body if snippet is thin and not paywalled
+        # Context enrichment: Proactively fetch full body if snippet is thin
         ai_context = summ
-        if is_thin and not paywalled:
+        if is_thin:
             full_body = await fetch_article_body(http_client, link)
-            if len(full_body) > len(summ_clean):
+            if len(full_body) > 200: # Found substantial text
                 ai_context = full_body
+                is_thin = False
+                paywalled = False # Override if we actually got the text
                 logger.info(f"[RSS] Enriched context for {source} (+{len(full_body)} chars)")
 
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
 
-        # DN always brief; others brief if paywalled AND thin
+        # DN always brief; others brief if still paywalled AND thin
         use_brief = is_dn or (paywalled and is_thin)
 
         try:

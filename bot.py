@@ -1393,7 +1393,8 @@ async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, r
 
 async def run_rss_once(app: Application, reason: str = "tick") -> None:
     bot = app.bot
-    client: OpenAI = app.bot_data["openai_client"]
+    openai_client: OpenAI = app.bot_data["openai_client"]
+    http_client: httpx.AsyncClient = app.bot_data["http_client"]
     conn: sqlite3.Connection = app.bot_data["db_conn"]
 
     now = time.time()
@@ -1412,7 +1413,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
     candidates = []
     for source, url in RSS_FEEDS:
         try:
-            feed = await fetch_feed(client, url)
+            feed = await fetch_feed(http_client, url)
             FEED_HEALTH[source] = 0 # Reset on success
         except Exception as e:
             logger.error(f"[RSS] fetch failed {source}: {e}")
@@ -1479,19 +1480,19 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         # Image extraction
         image_url = ""
         try:
-            image_url = await fetch_article_image(client, link)
+            image_url = await fetch_article_image(http_client, link)
         except Exception as ie:
             logger.error(f"[IMG] fetch failed {source}: {ie}")
             save_failure(conn, source, item_id, "fetch_image", str(ie))
             image_url = ""
 
-        if image_url and not await is_usable_image(client, image_url):
+        if image_url and not await is_usable_image(http_client, image_url):
             image_url = ""
 
         # Paywall logic (fixed)
         summ_clean = strip_html_text(summ or "")
         is_thin = len(summ_clean) < 180
-        paywalled = await is_paywalled_like(client, source, link, summ)
+        paywalled = await is_paywalled_like(http_client, source, link, summ)
 
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
@@ -1501,9 +1502,9 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
 
         try:
             if use_brief:
-                msg_html, generated_headline = await build_brief_message_html_ru(client, source, title, summ, link)
+                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, summ, link)
             else:
-                msg_html, generated_headline = await generate_post(client, source, title, summ, link, article_type)
+                msg_html, generated_headline = await generate_post(openai_client, source, title, summ, link, article_type)
         except Exception as ex:
             msg = str(ex)
 
@@ -1536,7 +1537,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             dropped += 1
             continue
 
-        if await is_semantically_similar(app.bot_data["openai_client"], generated_headline, recent_headlines):
+        if await is_semantically_similar(openai_client, generated_headline, recent_headlines):
             logger.info(f"[RSS] skipping semantically similar headline: {generated_headline} ({source})")
             dropped += 1
             continue
@@ -1544,7 +1545,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         if AUTO_POST:
             draft_id = save_draft(conn, msg_html, status="posted", image_url=image_url)
             try:
-                await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url, client=client)
+                await publish_to_channel(bot, PUBLIC_CHANNEL_ID, msg_html, image_url, client=http_client)
                 logger.info(f"[AUTO] posted draft #{draft_id} for {source}")
                 await bot.send_message(chat_id=EDITOR_CHAT_ID, text=f"🚀 Auto-posted #{draft_id} from {source}")
                 # Transaction safety: mark as posted AFTER success

@@ -1539,8 +1539,8 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 paywalled = False # Override if we actually got the text
                 logger.info(f"[RSS] Enriched context for {source} (+{len(full_body)} chars)")
 
-        # Brief if still paywalled AND thin
-        use_brief = (paywalled and is_thin)
+        # Brief if explicitly paywalled
+        use_brief = paywalled
 
         try:
             if use_brief:

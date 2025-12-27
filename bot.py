@@ -1406,9 +1406,7 @@ async def is_paywalled_like(client: httpx.AsyncClient, source: str, link: str, r
     except Exception:
         host = ""
 
-    # DN always paywalled
-    if host.endswith("dn.se"):
-        return True
+    # host ends with DN, etc., handled by general check below
 
     summ_clean = strip_html_text(rss_summary_raw or "")
     is_thin = len(summ_clean) < 180
@@ -1541,11 +1539,8 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 paywalled = False # Override if we actually got the text
                 logger.info(f"[RSS] Enriched context for {source} (+{len(full_body)} chars)")
 
-        host = (urlparse(link or "").netloc or "").lower()
-        is_dn = host.endswith("dn.se")
-
-        # DN always brief; others brief if still paywalled AND thin
-        use_brief = is_dn or (paywalled and is_thin)
+        # Brief if still paywalled AND thin
+        use_brief = (paywalled and is_thin)
 
         try:
             if use_brief:

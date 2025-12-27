@@ -243,6 +243,30 @@ META_OG_IMAGE_ALT_RE = re.compile(
 IMG_SRC_RE = re.compile(r"<img[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 
 
+async def fetch_article_body(client: httpx.AsyncClient, url: str) -> str:
+    """Fetches the actual HTML article and extracts paragraph text for better AI context."""
+    try:
+        resp = await safe_get(client, url, timeout=15.0)
+        html_content = resp.text
+        # Extract content from <p> tags using regex to avoid heavy dependencies like BeautifulSoup
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_content, re.S)
+        text_parts = []
+        for p in paragraphs:
+            # Clean up tags inside the paragraph
+            clean_p = re.sub(r'<[^>]+>', '', p)
+            clean_p = html.unescape(clean_p).strip()
+            # Basic heuristic: skip nav/small fragments
+            if len(clean_p) > 40:
+                text_parts.append(clean_p)
+        
+        # Join first few relevant paragraphs
+        body = "\n".join(text_parts[:15])
+        return body or ""
+    except Exception as e:
+        logger.debug(f"Failed to fetch article body for {url}: {e}")
+        return ""
+
+
 async def fetch_article_image(client: httpx.AsyncClient, article_url: str) -> str:
     u = (article_url or "").strip()
     if not u:
@@ -942,7 +966,9 @@ def openai_strict_blocks(client: OpenAI, source: str, title: str, rss_summary: s
 
 СТРОГО:
 - Пиши ТОЛЬКО по-русски.
-- Не выдумывай факты.
+- Используй ТОЛЬКО факты из предоставленного текста.
+- Если информации мало, не выдумывай "дипломатическую вежливость" или общие фразы.
+- Пиши КОНКРЕТНО: имена, цифры, даты, планы.
 - Никакого Markdown/HTML.
 - Верни РОВНО 5 блоков с метками: THINKING / HEADLINE / SUMMARY / DETAILS / HASHTAGS.
 
@@ -950,8 +976,10 @@ def openai_strict_blocks(client: OpenAI, source: str, title: str, rss_summary: s
 {format_rules}
 
 Источник: {source}
-Заголовок RSS: {title}
-Описание RSS: {rss_summary}
+Заголовок: {title}
+Контент для анализа:
+{rss_summary}
+
 Ссылка: {link}
 """.strip()
 
@@ -1489,10 +1517,18 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
         if image_url and not await is_usable_image(http_client, image_url):
             image_url = ""
 
-        # Paywall logic (fixed)
+        # Paywall logic
         summ_clean = strip_html_text(summ or "")
         is_thin = len(summ_clean) < 180
         paywalled = await is_paywalled_like(http_client, source, link, summ)
+
+        # Context enrichment: Fetch full body if snippet is thin and not paywalled
+        ai_context = summ
+        if is_thin and not paywalled:
+            full_body = await fetch_article_body(http_client, link)
+            if len(full_body) > len(summ_clean):
+                ai_context = full_body
+                logger.info(f"[RSS] Enriched context for {source} (+{len(full_body)} chars)")
 
         host = (urlparse(link or "").netloc or "").lower()
         is_dn = host.endswith("dn.se")
@@ -1502,9 +1538,9 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
 
         try:
             if use_brief:
-                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, summ, link)
+                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, ai_context, link)
             else:
-                msg_html, generated_headline = await generate_post(openai_client, source, title, summ, link, article_type)
+                msg_html, generated_headline = await generate_post(openai_client, source, title, ai_context, link, article_type)
         except Exception as ex:
             msg = str(ex)
 
@@ -1524,7 +1560,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
 
             # FINAL fallback: brief mode
             try:
-                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, summ, link)
+                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, ai_context, link)
                 logger.info(f"[FALLBACK] brief mode used for {source} due to: {ex}")
             except Exception as ex2:
                 dropped += 1

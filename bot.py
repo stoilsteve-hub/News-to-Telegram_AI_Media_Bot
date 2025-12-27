@@ -120,15 +120,12 @@ def google_news_rss(q: str) -> str:
 
 RSS_FEEDS = [
     ("SVT Nyheter", "https://www.svt.se/nyheter/rss.xml"),
-    ("SR Ekot", "https://api.sr.se/api/rss/pod/3795"),
-    ("8 Sidor", "https://8sidor.se/feed/"),
     ("Expressen Nyheter", "https://feeds.expressen.se/nyheter/"),
-    ("Government.se via Google", google_news_rss("site:government.se")),
     ("TV4.se via Google", google_news_rss("site:tv4.se")),
     ("Expressen Debatt", "https://feeds.expressen.se/debatt/"),
     ("Aftonbladet", "https://rss.aftonbladet.se/rss2/small/pages/sections/senastenytt/"),
     # Optional DN coverage:
-    # ("DN via Google", google_news_rss("site:dn.se")),
+    ("DN via Google", google_news_rss("site:dn.se")),
 ]
 
 KEYWORDS = [

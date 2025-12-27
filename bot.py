@@ -4,6 +4,7 @@ import html
 import time
 import sqlite3
 import asyncio
+import difflib
 import traceback
 from io import BytesIO
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -599,7 +600,8 @@ def init_db() -> sqlite3.Connection:
     c.execute("""
         CREATE TABLE IF NOT EXISTS posted (
             item_id TEXT PRIMARY KEY,
-            posted_at TEXT NOT NULL
+            posted_at TEXT NOT NULL,
+            title TEXT
         )
     """)
     c.execute("""
@@ -616,6 +618,7 @@ def init_db() -> sqlite3.Connection:
 
     # Store parsed image URL (non-breaking migration)
     _ensure_column(conn, "drafts", "image_url", "TEXT")
+    _ensure_column(conn, "posted", "title", "TEXT")
 
     return conn
 
@@ -626,8 +629,29 @@ def already_posted(conn: sqlite3.Connection, item_id: str) -> bool:
     return c.fetchone() is not None
 
 
-def mark_posted(conn: sqlite3.Connection, item_id: str) -> None:
-    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at) VALUES (?, ?)", (item_id, utc_now_iso()))
+def get_recent_titles(conn: sqlite3.Connection, limit: int = 100) -> list[str]:
+    c = conn.cursor()
+    c.execute("SELECT title FROM posted WHERE title IS NOT NULL AND title != '' ORDER BY posted_at DESC LIMIT ?",
+              (limit,))
+    return [row[0] for row in c.fetchall()]
+
+
+def is_similar(text1: str, text2: str, threshold: float = 0.7) -> bool:
+    """Check if two strings are similar using SequenceMatcher."""
+    if not text1 or not text2:
+        return False
+    # Normalize for comparison
+    t1 = text1.lower().strip()
+    t2 = text2.lower().strip()
+    if t1 == t2:
+        return True
+    ratio = difflib.SequenceMatcher(None, t1, t2).ratio()
+    return ratio >= threshold
+
+
+def mark_posted(conn: sqlite3.Connection, item_id: str, title: str = "") -> None:
+    conn.execute("INSERT OR IGNORE INTO posted (item_id, posted_at, title) VALUES (?, ?, ?)",
+                 (item_id, utc_now_iso(), title))
     conn.commit()
 
 
@@ -1017,6 +1041,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
     if now < next_ai_time:
         return
 
+    recent_titles = get_recent_titles(conn)
     candidates = []
     for source, url in RSS_FEEDS:
         try:
@@ -1040,9 +1065,25 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
             if s < MIN_SCORE:
                 continue
 
+            # Deduplication: check against recent database titles
+            if any(is_similar(title, rt) for rt in recent_titles):
+                print(f"[RSS] skipping similar (to DB): {title} ({source})", flush=True)
+                continue
+
             candidates.append((s, source, title, summ, link, item_id))
 
+    # Internal candidates deduplication (same run, different sources)
     candidates.sort(key=lambda x: x[0], reverse=True)
+    unique_candidates = []
+    seen_titles_this_run = []
+    for cand in candidates:
+        s, source, title, summ, link, item_id = cand
+        if any(is_similar(title, st) for st in seen_titles_this_run):
+            print(f"[RSS] skipping similar (in run): {title} ({source})", flush=True)
+            continue
+        unique_candidates.append(cand)
+        seen_titles_this_run.append(title)
+    candidates = unique_candidates
 
     if not candidates:
         print(f"[RSS] candidates=0 (reason={reason})", flush=True)
@@ -1123,7 +1164,7 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 conn.commit()
                 continue
 
-        mark_posted(conn, item_id)
+        mark_posted(conn, item_id, title=title)
         produced += 1
         await asyncio.sleep(1.0)
 

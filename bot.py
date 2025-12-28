@@ -1539,14 +1539,12 @@ async def run_rss_once(app: Application, reason: str = "tick") -> None:
                 paywalled = False # Override if we actually got the text
                 logger.info(f"[RSS] Enriched context for {source} (+{len(full_body)} chars)")
 
-        # Brief if explicitly paywalled
-        use_brief = paywalled
+        if paywalled:
+            logger.info(f"[RSS] skipping paywalled: {title} ({source})")
+            continue
 
         try:
-            if use_brief:
-                msg_html, generated_headline = await build_brief_message_html_ru(openai_client, source, title, ai_context, link)
-            else:
-                msg_html, generated_headline = await generate_post(openai_client, source, title, ai_context, link, article_type)
+            msg_html, generated_headline = await generate_post(openai_client, source, title, ai_context, link, article_type)
         except Exception as ex:
             msg = str(ex)
 
